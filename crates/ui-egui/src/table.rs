@@ -81,6 +81,17 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     small(ui, app, "delete", "", "Delete selected rows", "edit.delete", Value::Null, false);
                     small(ui, app, "field", "", "Add field", "ui.dialog", json!({"name": "addField"}), false);
                     small(ui, app, "calculate", "", "Calculate field", "ui.dialog", json!({"name": "calculateField"}), false);
+                    // Use the table's layer even another map layer active.
+                    small(
+                        ui,
+                        app,
+                        "calc_geom",
+                        "",
+                        "Calculate Geometry",
+                        "ui.dialog",
+                        json!({"name": "calculateGeometry", "layer": layer_id}),
+                        false,
+                    );
                     ui.add_space(6.0);
                     ui.checkbox(&mut app.table.selected_only, egui::RichText::new(tl!("Selected only")).size(11.5));
                 }

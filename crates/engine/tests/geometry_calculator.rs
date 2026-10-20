@@ -1,0 +1,96 @@
+use rustgis_engine::{
+    Project, Session,
+    data::{Dataset, Field, FieldType, Geometry, GeometryType, Value},
+    geom::Coord,
+};
+use serde_json::json;
+
+fn session(kind: GeometryType, geometries: Vec<Option<Geometry>>) -> (Session, u32) {
+    rustgis_engine::plugins::store::set_dir(Some(std::env::temp_dir().join("maraga-geometry-test-plugins")));
+    let mut s = Session::new(Project::default());
+    let mut ds = Dataset::new("test", kind, vec![Field::new("result", FieldType::Double), Field::new("integer", FieldType::Integer)]);
+    for g in geometries {
+        ds.push(g, vec![Value::Float(99.0), Value::Int(99)]);
+    }
+    let id = s.map_mut().add_dataset(ds);
+    s.active_layer = Some(id);
+    (s, id)
+}
+
+#[test]
+fn selected_units_overwrite_and_undo() {
+    let line = |x| Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(x, 0.0)]]));
+    let (mut s, id) = session(GeometryType::Polyline, vec![line(1.0), line(2.0), None]);
+    s.map_mut().layer_mut(id).unwrap().selection = vec![1];
+    let mut p = json!({"layer":id,"field":"result","property":"length","unit":"km","scope":"selected"});
+    assert!(s.run("edit.calculateGeometry", &p).is_err());
+    assert_eq!(s.map().layer(id).unwrap().dataset.value(1, 0).as_f64(), Some(99.0));
+    p["overwrite"] = json!(true);
+    assert_eq!(s.run("edit.calculateGeometry", &p).unwrap()["rows"], 1);
+    let value = s.map().layer(id).unwrap().dataset.value(1, 0).as_f64().unwrap();
+    assert!((222.0..223.0).contains(&value));
+    assert_eq!(s.map().layer(id).unwrap().dataset.value(0, 0).as_f64(), Some(99.0));
+    s.run("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().dataset.value(1, 0).as_f64(), Some(99.0));
+    p["create"] = json!(true);
+    p["field"] = json!("metres");
+    p["unit"] = json!("m");
+    p["scope"] = json!("all");
+    assert_eq!(s.run("edit.calculateGeometry", &p).unwrap()["nulls"], 1);
+    let ds = &s.map().layer(id).unwrap().dataset;
+    let fi = ds.field_index("metres").unwrap();
+    assert!((ds.value(1, fi).as_f64().unwrap() / value - 1000.0).abs() < 1e-9);
+    assert_eq!(ds.value(2, fi), &Value::Null);
+    s.run("edit.undo", &json!({})).unwrap();
+    assert!(s.map().layer(id).unwrap().dataset.field_index("metres").is_none());
+    s.map_mut().layer_mut(id).unwrap().selection.clear();
+    p["scope"] = json!("selected");
+    assert!(s.run("edit.calculateGeometry", &p).is_err());
+    assert!(s.map().layer(id).unwrap().dataset.field_index("metres").is_none());
+}
+
+#[test]
+fn polygon_holes_multipart_and_area_units() {
+    let ring = |x: f64, size: f64| {
+        vec![Coord::new(x, 0.0), Coord::new(x + size, 0.0), Coord::new(x + size, size), Coord::new(x, size), Coord::new(x, 0.0)]
+    };
+    let outer = ring(0.0, 0.01);
+    let hole = ring(0.002, 0.002);
+    let part = ring(0.02, 0.005);
+    let expected = rustgis_engine::geom::geodesic_ring_area_m2(&outer) - rustgis_engine::geom::geodesic_ring_area_m2(&hole)
+        + rustgis_engine::geom::geodesic_ring_area_m2(&part);
+    let (mut s, id) = session(GeometryType::Polygon, vec![Some(Geometry::Polygon(vec![vec![outer, hole], vec![part]]))]);
+    for (unit, divisor) in [("m2", 1.0), ("km2", 1e6), ("ha", 1e4), ("ac", 4046.8564224)] {
+        s.run("edit.calculateGeometry", &json!({"layer":id,"field":"result","overwrite":true,"property":"area","unit":unit,"scope":"all"}))
+            .unwrap();
+        let actual = s.map().layer(id).unwrap().dataset.value(0, 0).as_f64().unwrap();
+        assert!((actual - expected / divisor).abs() < 1e-6);
+    }
+    assert!(
+        s.run("edit.calculateGeometry", &json!({"layer":id,"field":"bad","create":true,"property":"length","unit":"m","scope":"all"}))
+            .is_err()
+    );
+    assert!(s.map().layer(id).unwrap().dataset.field_index("bad").is_none());
+}
+
+#[test]
+fn coordinates_projection_rounding_and_atomic_validation() {
+    let (mut s, id) = session(GeometryType::Point, vec![Some(Geometry::Point(Coord::new(117.0, 3.0)))]);
+    let mut p = json!({"layer":id,"field":"result","overwrite":true,"property":"x","unit":"deg","scope":"all"});
+    s.run("edit.calculateGeometry", &p).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().dataset.value(0, 0).as_f64(), Some(117.0));
+    p["unit"] = json!("projected");
+    p["epsg"] = json!(32650);
+    s.run("edit.calculateGeometry", &p).unwrap();
+    assert!((s.map().layer(id).unwrap().dataset.value(0, 0).as_f64().unwrap() - 500000.0).abs() < 1.0);
+    p["epsg"] = json!(4326);
+    assert!(s.run("edit.calculateGeometry", &p).is_err());
+    assert!((s.map().layer(id).unwrap().dataset.value(0, 0).as_f64().unwrap() - 500000.0).abs() < 1.0);
+    p["unit"] = json!("deg");
+    p["property"] = json!("y");
+    p["field"] = json!("integer");
+    s.run("edit.calculateGeometry", &p).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().dataset.value(0, 1), &Value::Int(3));
+    s.map_mut().editing.settings.enabled = false;
+    assert!(s.run("edit.calculateGeometry", &p).is_err());
+}
