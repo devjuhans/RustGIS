@@ -123,6 +123,15 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     ui.horizontal(|ui| {
                         if ui.radio_value(&mut f.create, true, tl!("New field")).changed() {
                             f.overwrite = false;
+                            f.field_edited = false;
+                            let base = format!("{}_{}", f.property, f.unit);
+                            f.field = base.clone();
+                            let mut n = 2;
+                            while l.dataset.field_index(&f.field).is_some() {
+                                f.field = format!("{base}_{n}");
+                                n += 1;
+                            }
+                            f.error = None;
                         }
                         if ui.add_enabled(!fields.is_empty(), egui::RadioButton::new(!f.create, tl!("Existing field"))).clicked() {
                             f.create = false;
