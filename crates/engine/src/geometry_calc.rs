@@ -110,7 +110,9 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
                 return Err("feature geometry does not match the layer".into());
             }
             let mut valid = true;
-            g.for_each_coord(|c| valid &= c.is_finite() && (-90.0..=90.0).contains(&c.y));
+            g.for_each_coord(|c| {
+                valid &= c.is_finite() && (-180.0..=180.0).contains(&c.x) && (-90.0..=90.0).contains(&c.y);
+            });
             if !valid {
                 return Err(format!("feature {} has invalid coordinates", f.id));
             }

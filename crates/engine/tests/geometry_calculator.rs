@@ -94,3 +94,39 @@ fn coordinates_projection_rounding_and_atomic_validation() {
     s.map_mut().editing.settings.enabled = false;
     assert!(s.run("edit.calculateGeometry", &p).is_err());
 }
+
+#[test]
+fn longitude_bounds_and_failed_calculation_preserve_data() {
+    for x in [-180.0, 180.0] {
+        let (mut s, id) = session(GeometryType::Point, vec![Some(Geometry::Point(Coord::new(x, 0.0)))]);
+        s.run(
+            "edit.calculateGeometry",
+            &json!({
+                "layer": id, "field": "result", "overwrite": true,
+                "property": "x", "unit": "deg", "scope": "all"
+            }),
+        )
+        .unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.value(0, 0).as_f64(), Some(x));
+    }
+
+    for x in [-180.001, 180.001, -1e300, 1e300] {
+        let (mut s, id) =
+            session(GeometryType::Point, vec![Some(Geometry::Point(Coord::new(117.0, 3.0))), Some(Geometry::Point(Coord::new(x, 0.0)))]);
+        let mut p = json!({
+            "layer": id, "field": "result", "overwrite": true,
+            "property": "x", "unit": "deg", "scope": "all"
+        });
+
+        let error = s.run("edit.calculateGeometry", &p).unwrap_err();
+        assert!(error.contains("invalid coordinates"), "{error}");
+        for row in 0..2 {
+            assert_eq!(s.map().layer(id).unwrap().dataset.value(row, 0).as_f64(), Some(99.0),);
+        }
+
+        p["create"] = json!(true);
+        p["field"] = json!("new_x");
+        assert!(s.run("edit.calculateGeometry", &p).is_err());
+        assert!(s.map().layer(id).unwrap().dataset.field_index("new_x").is_none());
+    }
+}
