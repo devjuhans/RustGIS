@@ -1,9 +1,11 @@
-//! MARAGA attribute geometry calculator. Stored attributes, calculated from WGS84 geometry.
+//! The attribute table's geometry calculator: stores each feature's area, perimeter, length or
+//! X/Y coordinate, calculated from its WGS84 geometry, in a field.
 use crate::{CmdResult, Session};
 use rustgis_data::{FieldType, Geometry, GeometryType, Value, raster::Crs};
 use rustgis_geom::{geodesic_length_m, geodesic_ring_area_m2, spherical_centre};
 use serde_json::{Value as Json, json};
 
+/// The properties a layer of `kind` can calculate, as `(key, label)` pairs.
 pub fn properties(kind: GeometryType) -> &'static [(&'static str, &'static str)] {
     match kind {
         GeometryType::Polygon => &[("area", "Area"), ("perimeter", "Perimeter")],
@@ -13,6 +15,7 @@ pub fn properties(kind: GeometryType) -> &'static [(&'static str, &'static str)]
     }
 }
 
+/// The units `property` can be calculated in, as `(key, label)` pairs.
 pub fn units(property: &str) -> &'static [(&'static str, &'static str)] {
     match property {
         "area" => &[("m2", "Square metres"), ("km2", "Square kilometres"), ("ha", "Hectares"), ("ac", "Acres")],
@@ -45,6 +48,8 @@ fn measure(g: &Geometry, property: &str) -> Option<f64> {
     }
 }
 
+/// Runs `edit.calculateGeometry`: fills `field` (new or existing numeric) of the chosen features
+/// with `property` in `unit`, as one undo step; on any error nothing changes.
 pub fn run(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no layer")?;
@@ -109,9 +114,12 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
             if g.kind() != l.geometry_type() {
                 return Err("feature geometry does not match the layer".into());
             }
+            // Lengths and areas use longitude differences, so a shape drawn or buffered across the
+            // antimeridian may run past ±180°; a coordinate has to be a real longitude.
+            let max_x = if matches!(property, "x" | "y") { 180.0 } else { 360.0 };
             let mut valid = true;
             g.for_each_coord(|c| {
-                valid &= c.is_finite() && (-180.0..=180.0).contains(&c.x) && (-90.0..=90.0).contains(&c.y);
+                valid &= c.is_finite() && (-max_x..=max_x).contains(&c.x) && (-90.0..=90.0).contains(&c.y);
             });
             if !valid {
                 return Err(format!("feature {} has invalid coordinates", f.id));

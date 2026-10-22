@@ -6,7 +6,7 @@ use rustgis_engine::{
 use serde_json::json;
 
 fn session(kind: GeometryType, geometries: Vec<Option<Geometry>>) -> (Session, u32) {
-    rustgis_engine::plugins::store::set_dir(Some(std::env::temp_dir().join("maraga-geometry-test-plugins")));
+    rustgis_engine::plugins::store::set_dir(Some(std::env::temp_dir().join("rustgis-geometry-calc-test-plugins")));
     let mut s = Session::new(Project::default());
     let mut ds = Dataset::new("test", kind, vec![Field::new("result", FieldType::Double), Field::new("integer", FieldType::Integer)]);
     for g in geometries {
@@ -128,5 +128,37 @@ fn longitude_bounds_and_failed_calculation_preserve_data() {
         p["field"] = json!("new_x");
         assert!(s.run("edit.calculateGeometry", &p).is_err());
         assert!(s.map().layer(id).unwrap().dataset.field_index("new_x").is_none());
+    }
+}
+
+/// A buffer near the antimeridian runs past 180°: its area is still measured, while a point's
+/// coordinate must stay a real longitude.
+#[test]
+fn polygons_across_the_antimeridian_are_measured() {
+    let (mut s, id) = session(GeometryType::Point, vec![Some(Geometry::Point(Coord::new(179.99, 0.0)))]);
+    let name = s.map().layer(id).unwrap().name.clone();
+    s.run("gp.run", &json!({"tool": "buffer", "params": {"input": name, "distance": 10, "units": "Kilometers"}})).unwrap();
+    let buffer = s.map().layers.iter().find(|l| l.geometry_type() == GeometryType::Polygon).map(|l| l.id).unwrap();
+    let mut max_x = f64::MIN;
+    for f in &s.map().layer(buffer).unwrap().dataset.features {
+        f.geometry.as_ref().unwrap().for_each_coord(|c| max_x = max_x.max(c.x));
+    }
+    assert!(max_x > 180.0, "the buffer crosses the antimeridian: {max_x}");
+    s.run(
+        "edit.calculateGeometry",
+        &json!({"layer": buffer, "field": "area", "create": true, "property": "area", "unit": "km2", "scope": "all"}),
+    )
+    .unwrap();
+    let ds = &s.map().layer(buffer).unwrap().dataset;
+    let area = ds.value(0, ds.field_index("area").unwrap()).as_f64().unwrap();
+    assert!((300.0..330.0).contains(&area), "about π·10² km²: {area}");
+
+    let ring = vec![Coord::new(179.0, 0.0), Coord::new(181.0, 0.0), Coord::new(181.0, 1.0), Coord::new(179.0, 1.0), Coord::new(179.0, 0.0)];
+    let (mut s, id) = session(GeometryType::Polygon, vec![Some(Geometry::Polygon(vec![vec![ring]]))]);
+    for property in ["area", "perimeter"] {
+        let unit = if property == "area" { "km2" } else { "km" };
+        let p = json!({"layer": id, "field": "result", "overwrite": true, "property": property, "unit": unit, "scope": "all"});
+        s.run("edit.calculateGeometry", &p).unwrap();
+        assert!(s.map().layer(id).unwrap().dataset.value(0, 0).as_f64().unwrap() > 0.0);
     }
 }

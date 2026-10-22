@@ -7,6 +7,7 @@ use rustgis_engine::{
 };
 use serde_json::json;
 
+/// The state of the Calculate Geometry dialog.
 pub struct Form {
     pub layer: u32,
     property: String,
@@ -21,6 +22,7 @@ pub struct Form {
 }
 
 impl Form {
+    /// A form for `layer`, writing its first property to a new, uniquely named field.
     pub fn new(s: &Session, layer: u32) -> Result<Self, String> {
         let l = s.map().layer(layer).ok_or_else(|| tl!("Layer not found").to_string())?;
         let property = properties(l.geometry_type()).first().map(|v| v.0).ok_or_else(|| tl!("No geometry to calculate").to_string())?;
@@ -47,6 +49,7 @@ impl Form {
     }
 }
 
+/// A combo box over `choices` (`(key, label)` pairs) editing the key `value`; true when changed.
 fn choice(ui: &mut egui::Ui, id: &str, value: &mut String, choices: &[(&str, &str)], width: f32) -> bool {
     let mut changed = false;
     let label = choices.iter().find(|(k, _)| *k == value).map(|v| v.1).unwrap_or("");
@@ -58,6 +61,7 @@ fn choice(ui: &mut egui::Ui, id: &str, value: &mut String, choices: &[(&str, &st
     changed
 }
 
+/// Shows the dialog while it is open and runs `edit.calculateGeometry` on Calculate.
 pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let Some(mut f) = app.dialogs.geometry.take() else { return };
     let Some(l) = app.session.map().layer(f.layer) else {
@@ -193,9 +197,12 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 });
             }
         });
-    if calculate {
-        let p = json!({"layer": f.layer, "field": f.field, "create": f.create, "overwrite": f.overwrite,
-            "property": f.property, "unit": f.unit, "epsg": f.epsg.trim().parse::<u32>().ok(), "scope": if f.selected { "selected" } else { "all" }});
+    let epsg = f.epsg.trim().parse::<u32>().ok();
+    if calculate && f.unit == "projected" && epsg.is_none() {
+        f.error = Some(tl!("Enter an EPSG code as a number, such as 32650").to_string());
+    } else if calculate {
+        let p = json!({"layer": f.layer, "field": f.field.trim(), "create": f.create, "overwrite": f.overwrite,
+            "property": f.property, "unit": f.unit, "epsg": epsg, "scope": if f.selected { "selected" } else { "all" }});
         match app.run("edit.calculateGeometry", p) {
             Ok(result) => {
                 app.session.notify(crate::i18n::fmt("Calculated {rows} features", &[("rows", &result["rows"].to_string())]), false);

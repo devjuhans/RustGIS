@@ -81,7 +81,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     small(ui, app, "delete", "", "Delete selected rows", "edit.delete", Value::Null, false);
                     small(ui, app, "field", "", "Add field", "ui.dialog", json!({"name": "addField"}), false);
                     small(ui, app, "calculate", "", "Calculate field", "ui.dialog", json!({"name": "calculateField"}), false);
-                    // Use the table's layer even another map layer active.
+                    // The table's layer, even when another layer is active in Layers.
                     small(
                         ui,
                         app,
