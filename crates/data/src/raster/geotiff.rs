@@ -35,6 +35,17 @@ struct Geo {
     nodata: Option<f64>,
     /// Why the file's own projection couldn't be read, if it has one.
     custom_error: Option<String>,
+    /// `false` for a TIFF with no GeoTIFF tags at all: `transform` is then a stand-in.
+    referenced: bool,
+}
+
+/// How `n` samples of a grey image the decoder calls multiband are shown: grey with alpha when
+/// there are two and the second is declared alpha (extra sample 1, associated, or 2, unassociated),
+/// else grey. GDAL marks the second band of an ordinary two-band file as 0, unspecified data.
+pub(super) fn multiband_color<R: Read + Seek>(dec: &mut Decoder<R>, n: u16) -> ColorHint {
+    let alpha =
+        n == 2 && dec.find_tag_unsigned_vec::<u16>(Tag::ExtraSamples).ok().flatten().is_some_and(|v| matches!(v.first(), Some(1 | 2)));
+    if alpha { ColorHint::GrayAlpha } else { ColorHint::Gray }
 }
 
 fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
@@ -69,6 +80,9 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
         (code, code.and_then(Crs::from_epsg))
     };
 
+    // A TIFF with none of the GeoTIFF tags is a scan; one with only some of them is damaged.
+    let tagless = keys.is_empty() && [33550u16, 33922, 34264].iter().all(|t| dec.find_tag(Tag::Unknown(*t)).ok().flatten().is_none());
+    let mut referenced = true;
     let mut affine = None;
     let transform = if let Some(m) = doubles(dec, 34264).filter(|m| m.len() >= 8) {
         let at = |i: usize| m.get(i).copied().unwrap_or(0.0);
@@ -77,11 +91,18 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
         }
         GeoTransform { origin_x: at(3), origin_y: at(7), pixel_width: at(0), pixel_height: at(5) }
     } else {
-        let scale = doubles(dec, 33550).filter(|s| s.len() >= 2).ok_or_else(|| err("the file isn't georeferenced"))?;
-        let tie = doubles(dec, 33922).filter(|t| t.len() >= 6).ok_or_else(|| err("the file isn't georeferenced"))?;
-        let s = |i: usize| scale.get(i).copied().unwrap_or(0.0);
-        let t = |i: usize| tie.get(i).copied().unwrap_or(0.0);
-        GeoTransform { origin_x: t(3) - t(0) * s(0), origin_y: t(4) + t(1) * s(1), pixel_width: s(0), pixel_height: -s(1) }
+        match (doubles(dec, 33550).filter(|s| s.len() >= 2), doubles(dec, 33922).filter(|t| t.len() >= 6)) {
+            (Some(scale), Some(tie)) => {
+                let s = |i: usize| scale.get(i).copied().unwrap_or(0.0);
+                let t = |i: usize| tie.get(i).copied().unwrap_or(0.0);
+                GeoTransform { origin_x: t(3) - t(0) * s(0), origin_y: t(4) + t(1) * s(1), pixel_width: s(0), pixel_height: -s(1) }
+            }
+            _ if tagless => {
+                referenced = false;
+                GeoTransform { origin_x: 0.0, origin_y: 0.0, pixel_width: 1.0, pixel_height: -1.0 }
+            }
+            _ => return Err(err("the file isn't georeferenced")),
+        }
     };
     // A point's value is at a pixel's centre: the image starts half a pixel up and left of it.
     let affine =
@@ -105,14 +126,15 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
         .flatten()
         .and_then(|v| v.into_string().ok())
         .and_then(|s| s.trim_matches(|c: char| c == '\0' || c.is_whitespace()).parse::<f64>().ok());
-    Ok(Geo { transform, affine, crs, unknown_epsg: code.filter(|_| crs.is_none()), geographic_model, nodata, custom_error })
+    Ok(Geo { transform, affine, crs, unknown_epsg: code.filter(|_| crs.is_none()), geographic_model, nodata, custom_error, referenced })
 }
 
 /// A cloud-optimised GeoTIFF's coordinate system, georeferencing and no-data value, from its first
-/// image (as [`read`] finds them); `None` for a rotated or skewed image, which is read whole.
+/// image (as [`read`] finds them); `None` for a rotated or skewed image, or one with no GeoTIFF
+/// tags (a scan), which is read whole.
 pub(crate) fn cog_geo<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Option<(Crs, GeoTransform, Option<f64>)>> {
     let geo = geo_tags(dec)?;
-    if geo.affine.is_some() {
+    if geo.affine.is_some() || !geo.referenced {
         return Ok(None);
     }
     let crs = match geo.crs {
@@ -832,7 +854,7 @@ pub fn read_file(path: &std::path::Path, name: &str) -> Result<Raster> {
 
 /// [`read`], holding at most `max` samples (the tests' small limit exercises the overviews), with
 /// `open` making more readers of the same file for decoding it on several threads.
-fn read_limited(r: Reader<'_>, name: &str, max: usize, open: Option<Opener<'_>>) -> Result<Raster> {
+pub(super) fn read_limited(r: Reader<'_>, name: &str, max: usize, open: Option<Opener<'_>>) -> Result<Raster> {
     let palette = !r.patches.is_empty();
     let limits = {
         let mut l = Limits::default();
@@ -931,7 +953,7 @@ fn read_limited(r: Reader<'_>, name: &str, max: usize, open: Option<Opener<'_>>)
             let table = if map.len() >= 3 * n { (0..n).map(|i| [c(i), c(n + i), c(2 * n + i), 255]).collect() } else { Vec::new() };
             (1, if table.is_empty() { ColorHint::Gray } else { ColorHint::Palette(table) })
         }
-        ColorType::Multiband { num_samples, .. } => (num_samples.max(1) as usize, ColorHint::Gray),
+        ColorType::Multiband { num_samples, .. } => (num_samples.max(1) as usize, multiband_color(&mut dec, num_samples)),
         other => return Err(err(format!("{other:?} images aren't supported"))),
     };
     let planar = dec.find_tag_unsigned::<u16>(Tag::PlanarConfiguration).ok().flatten() == Some(2);
@@ -998,6 +1020,13 @@ fn read_limited(r: Reader<'_>, name: &str, max: usize, open: Option<Opener<'_>>)
         decimate(&mut dec, iw, ih, nbands, planar, decimate_by, open)?
     };
 
+    // A scan keeps a stand-in transform, sized to the pixels read.
+    if !geo.referenced {
+        let mut r = Raster::new(name, w, h, bands, super::unreferenced(w, h), Crs::LonLat, geo.nodata, color, data_type)?;
+        r.georeferenced = false;
+        r.overview = overview;
+        return Ok(r);
+    }
     let mut transform = geo.transform;
     // How many full-image pixels one pixel read spans, across and down.
     let (sx, sy) = if decimate_by > 1 {
@@ -1045,20 +1074,14 @@ fn read_limited(r: Reader<'_>, name: &str, max: usize, open: Option<Opener<'_>>)
     Ok(r)
 }
 
-/// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
-/// when they are 8-bit, else 32-bit floats, alpha kept), so it reads back in colour; otherwise
-/// `band` (0-based) as 32-bit floats. `band` is for rasters that aren't colour ones: a colour
-/// raster always writes its colour bands, as its 8-bit form did before.
-pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
-    use tiff::encoder::{Compression, DeflateLevel, TiffEncoder, colortype};
-    let mut out = std::io::Cursor::new(Vec::new());
-    let mut enc = TiffEncoder::new(&mut out).map_err(err)?.with_compression(Compression::Deflate(DeflateLevel::Balanced));
-    let gt = r.transform;
-    if gt.pixel_height > 0.0 || gt.pixel_width < 0.0 {
-        return Err(err("only north-up rasters can be exported for now"));
-    }
-    let scale = [gt.pixel_width.abs(), gt.pixel_height.abs(), 0.0];
-    let tie = [0.0, 0.0, 0.0, gt.origin_x, gt.origin_y, 0.0];
+/// The GeoKey directory a raster's coordinate system is written as, and the user-defined system
+/// whose double and ASCII parameters go with it.
+pub(super) struct GeoKeys {
+    pub keys: Vec<u16>,
+    pub custom: Option<std::sync::Arc<CustomCrs>>,
+}
+
+pub(super) fn geo_keys(r: &Raster) -> Result<GeoKeys> {
     let geographic = r.crs.is_geographic();
     // A file's own projection is written back as the keys it came in.
     let custom = r.crs.custom_def().map(|d| {
@@ -1096,19 +1119,42 @@ pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
             r.crs.epsg(),
         ],
     };
+    Ok(GeoKeys { keys, custom })
+}
+
+/// Whether band `b` is written as bytes: whole numbers within 0–255 (or no valid pixels at all),
+/// and a no-data value that is one too.
+pub(super) fn fits_bytes(r: &Raster, b: usize) -> bool {
+    let Some(band) = r.bands.get(b) else { return false };
+    let s = &band.stats;
+    let whole_bytes = s.min >= 0.0 && s.max <= 255.0 && (s.categories.is_some() || r.data_type == "UInt8");
+    let nodata_ok = r.nodata.is_none_or(|d| (0.0..=255.0).contains(&d) && d.fract() == 0.0);
+    nodata_ok && (whole_bytes || s.count == 0)
+}
+
+/// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
+/// when they are 8-bit, else 32-bit floats, alpha kept), so it reads back in colour; otherwise
+/// `band` (0-based) as 32-bit floats. `band` is for rasters that aren't colour ones: a colour
+/// raster always writes its colour bands, as its 8-bit form did before.
+pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
+    use tiff::encoder::{Compression, DeflateLevel, TiffEncoder, colortype};
+    // A scan's place is only where it was laid on the view: not coordinates to write into a file.
+    r.require_coordinates().map_err(err)?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut enc = TiffEncoder::new(&mut out).map_err(err)?.with_compression(Compression::Deflate(DeflateLevel::Balanced));
+    let gt = r.transform;
+    if gt.pixel_height > 0.0 || gt.pixel_width < 0.0 {
+        return Err(err("only north-up rasters can be exported for now"));
+    }
+    let scale = [gt.pixel_width.abs(), gt.pixel_height.abs(), 0.0];
+    let tie = [0.0, 0.0, 0.0, gt.origin_x, gt.origin_y, 0.0];
+    let GeoKeys { keys, custom } = geo_keys(r)?;
     let (w, h) = (r.width, r.height);
     let bytes = |b: usize| -> Option<Vec<u8>> {
         let band = r.bands.get(b)?;
-        let s = &band.stats;
-        // Whole numbers within 0–255 (or no valid pixels at all) fit in a byte, and so must the
-        // no-data value, which no-data pixels keep so the written GDAL_NODATA tag still matches.
-        let whole_bytes = s.min >= 0.0 && s.max <= 255.0 && (s.categories.is_some() || r.data_type == "UInt8");
-        let nodata = match r.nodata {
-            Some(d) if (0.0..=255.0).contains(&d) && d.fract() == 0.0 => Some(d as u8),
-            Some(_) => return None,
-            None => None,
-        };
-        (whole_bytes || s.count == 0)
+        // No-data pixels keep the no-data value, so the written GDAL_NODATA tag still matches.
+        let nodata = r.nodata.map(|d| d as u8);
+        fits_bytes(r, b)
             .then(|| band.data.iter().map(|v| if r.is_valid(*v) { v.clamp(0.0, 255.0) as u8 } else { nodata.unwrap_or(0) }).collect())
     };
     let rgb = matches!(r.color, ColorHint::Rgb { .. }) && r.bands.len() >= 3;
@@ -1368,12 +1414,12 @@ mod tests {
     }
 
     #[test]
-    fn plain_tiff_is_not_georeferenced() {
+    fn plain_tiff_opens_as_a_scan() {
         use tiff::encoder::{TiffEncoder, colortype};
         let mut out = std::io::Cursor::new(Vec::new());
         TiffEncoder::new(&mut out).unwrap().write_image::<colortype::Gray8>(2, 2, &[1, 2, 3, 4]).unwrap();
-        let e = read(std::io::Cursor::new(out.into_inner()), "x").unwrap_err();
-        assert!(e.to_string().contains("georeferenced"), "{e}");
+        let r = read(std::io::Cursor::new(out.into_inner()), "x").unwrap();
+        assert_eq!((r.width, r.height, r.georeferenced), (2, 2, false));
     }
 
     #[test]

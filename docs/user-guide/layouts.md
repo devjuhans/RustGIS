@@ -72,8 +72,15 @@ the maps; while one is open, its groups lead the Publish tab:
   either diagonal) add a shape in the middle of the page, to frame, highlight or divide parts of
   it. A circle is an ellipse in a square box. The properties set a shape's fill, outline and
   outline width (0 for none; a fill with no opacity leaves only the outline), and a line's colour,
-  width and direction. From a command:
+  width, arrowheads and angle. From a command:
   `layout.addElement={"kind":"line","dir":"falling","color":"#C0392B","width":2}`.
+- **Arrows**: **Arrow** adds an arrow pointing right. Drag the round handle above a selected arrow
+  or line to turn it about its centre: it snaps to level, upright and diagonal within 3°, and
+  **Shift** turns it in 15° steps. **Angle** in its properties sets it exactly (0° points right,
+  90° up), and **Arrowheads** puts heads at its end, its start, both or neither, so any line can
+  be an arrow. From a command:
+  `layout.addElement={"kind":"arrow","angle":30,"length":60}`, or
+  `layout.update={"element":7,"angle":-90}` to turn one.
 - **Text** and **Dynamic Text**: `{date}`, `{time}`, `{scale}`, `{map}`, `{crs}`, `{page}`,
   `{pages}`, `{pageName}` and `{layout}` fill in when the page is drawn; the Format pane's
   **Insert Dynamic Text** menu, under the text, lists each with what it shows. The text, its
@@ -90,7 +97,8 @@ the maps; while one is open, its groups lead the Publish tab:
   the element selected; selecting an element, or clicking the selected one, opens it again. The
   wheel zooms the page. **Delete** (or **Backspace**, the delete key on a
   Mac) deletes the selected element, and **Ctrl+D** (**⌘D** on a Mac) duplicates it: the copy is
-  placed 5 mm down and to the right, on top, and selected.
+  placed 5 mm down and to the right, on top, and selected. The **arrow keys** nudge it 1 mm, or
+  10 mm with **Shift**, and keep it moving while held; a run of nudges is one step to undo.
 - **Locked**, at the top of the Format pane, keeps a finished element from being changed by
   mistake: it can still be selected (a lock marks its corner, and it has no handles), but not
   moved, resized, deleted or edited, and a locked map frame's map isn't panned or zoomed. A map

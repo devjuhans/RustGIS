@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::theme::{Tokens, c32, regular, semibold};
 use crate::{RustGisApp, icons};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct Key {
     rev: u64,
     cam: (i64, i64, i64, i64, i64),
@@ -109,7 +109,14 @@ pub struct MapView {
     label_map: Vec<Option<Coord>>,
     /// The camera the labels were placed for.
     label_camera: Camera,
+    /// The map revision whose GPU scene had only live tile layers (#635): tiles arriving draw
+    /// no new scene of it.
+    live_rev: Option<u64>,
     last_interaction: f64,
+    /// The view's size (physical pixels) on the last frame, and when it last changed: while a
+    /// side pane is dragged the last frame is shown as it is, drawn again once the size holds.
+    view_px: [usize; 2],
+    resized_at: f64,
     drag: Option<(Pos2, DragKind)>,
     sketch: Vec<Coord>,
     /// A finished measurement stays on screen until the next click.
@@ -202,7 +209,10 @@ impl Default for MapView {
             labels: Vec::new(),
             label_lonlat: Vec::new(),
             label_camera: Camera::world(),
+            live_rev: None,
             last_interaction: -10.0,
+            view_px: [0, 0],
+            resized_at: -10.0,
             drag: None,
             sketch: Vec::new(),
             sketch_done: false,
@@ -295,6 +305,12 @@ impl MapView {
     /// tests).
     pub fn moves_on_gpu(&self) -> bool {
         self.gpu_frame.as_ref().is_some_and(|f| !f.has_images)
+    }
+
+    /// Whether the map shown places its tile layers for every frame (#635): its tiles are for the
+    /// camera shown, whatever camera its scene was drawn for (diagnostics and tests).
+    pub fn shows_live_tiles(&self) -> bool {
+        self.gpu_frame.as_ref().is_some_and(|f| f.tiles_live)
     }
 
     /// How long the last map draw took, in milliseconds.
@@ -445,6 +461,8 @@ fn split_view(app: &mut RustGisApp, ui: &mut Ui, other: usize, rect: Rect, t: &T
                 buffers: bufs.clone(),
                 target: app.map.gpu_target_split.clone(),
                 uv: Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                live: None,
+                repaint: None,
             },
         ));
         for l in labels {
@@ -568,7 +586,11 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         rustgis_engine::map::source::set_waker(move || ctx.request_repaint());
     });
     let mut key = key;
-    if fetches_tiles(app.session.map()) {
+    // A scene whose tile layers are all live places them for every frame: tiles arriving need no
+    // new scene (#635).
+    if gpu_ok && cam.bearing == 0.0 && cam.pitch == 0.0 && app.map.live_rev == Some(app.session.revision) {
+        key.tiles = 0;
+    } else if fetches_tiles(app.session.map()) {
         key.tiles = rustgis_engine::render::rustgis_tiles::cache::generation();
         if let Some(old) = app.map.key
             && old.tiles != key.tiles
@@ -578,6 +600,27 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             key.tiles = old.tiles;
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         }
+    }
+    if app.map.view_px != key.size {
+        // Not the first size: the view has a picture to hold only after that.
+        if app.map.view_px != [0, 0] {
+            app.map.resized_at = time;
+        }
+        app.map.view_px = key.size;
+    }
+    // A side pane being dragged (or the window resized) resizes the view every frame. Drawing the
+    // map each time made the drag stutter: the last frame stays centred at its own scale (the uncovered edge shows the
+    // map's background) until the size holds for a moment, as a pan shows its last frame.
+    let resizing = time - app.map.resized_at < RESIZE_SETTLE;
+    let hold = resizing
+        && !moving
+        && !globe_view
+        && cam.bearing == 0.0
+        && cam.pitch == 0.0
+        && (app.map.texture.is_some() || app.map.gpu_frame.is_some())
+        && app.map.key.is_some_and(|k| (Key { size: k.size, draft: k.draft, ..key }) == k);
+    if hold {
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(RESIZE_SETTLE));
     }
     // Labels belong to the rendered contents. When visibility or data change, old labels
     // must disappear with their layers while a preview stands in for the exact frame.
@@ -589,12 +632,34 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // Exact globe, tilted and tiled flat frames are composed off the UI thread. A drape or
     // cached flat picture keeps navigation and layer changes responsive while they finish.
     let tiled_flat = !globe_view && cam.bearing == 0.0 && cam.pitch == 0.0 && !app.session.map().tiles.is_empty();
-    let settling = (tilted || globe_view || tiled_flat) && !moving && app.ws.playing.is_none();
+    let settling = (tilted || globe_view || tiled_flat) && !moving && app.ws.playing.is_none() && !hold;
     let mut tilt_draped = tilt_draped;
     // A frame finishing during a new gesture is obsolete. Drain it now so it neither holds
     // the worker slot nor keeps screenshot/idle waiters waiting for a frame we will not show.
     if !settling && let Some((_, done)) = app.map.tilt_settle.take() {
         app.session.map_mut().adopt_caches(&done.map);
+    }
+    // A GPU scene that re-projects (no pictures) of this map, at this size: a camera move needs
+    // no picture drawn on the CPU meanwhile. One whose tile layers are all live, without labels
+    // to place again, that still holds the view at about its zoom needs no new scene at all:
+    // its tiles are placed for every frame (#635).
+    let reprojects = gpu_ok
+        && app.map.gpu_frame.as_ref().is_some_and(|f| !f.has_images && f.fits(&cam))
+        && app.map.key.is_some_and(|k| k.rev == key.rev && k.size == key.size && k.sources == key.sources && !k.draft);
+    let live_holds = reprojects
+        && app.map.gpu_frame.as_ref().is_some_and(|f| f.tiles_live)
+        && app.map.labels.is_empty()
+        && scene_covers(app.map.tex_camera, cam, w, h)
+        && (0.5..=2.0).contains(&(cam.res / app.map.tex_camera.res.max(1e-12)));
+    if settling && live_holds && app.map.key != Some(key) {
+        if let (Some(gf), Some(rs)) = (&app.map.gpu_frame, &app.map.render_state) {
+            gf.set_camera(&rs.queue, &cam);
+        }
+        app.map.key = Some(key);
+        if app.map.camera_moved {
+            app.session.record_extent();
+            app.map.camera_moved = false;
+        }
     }
     if settling {
         let same_view = |a: Key, b: Key| Key { tiles: b.tiles, sources: b.sources, ..a } == b;
@@ -637,7 +702,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if tilted {
                 rustgis_engine::render::sync_tilted_view(app.session.map_mut(), &view);
             }
-            let backend = if gpu_ok { rustgis_engine::render::Backend::Gpu } else { rustgis_engine::render::Backend::Cpu };
+            let backend = if gpu_ok { rustgis_engine::render::Backend::GpuLive } else { rustgis_engine::render::Backend::Cpu };
             app.map.tilt_settle.start_backend(ui.ctx(), key, app.session.map().clone(), view, backend);
         }
         let shown = (app.map.texture.is_some() || app.map.gpu_frame.is_some())
@@ -650,7 +715,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 draped = app.map.drape.prepare(ui.ctx(), app.session.map_mut(), drape_key, tiles, w, h, ppp, time);
             } else if tilted {
                 tilt_draped = app.map.tilt_drape.prepare(ui.ctx(), app.session.map_mut(), drape_key, tiles, w, h, ppp, time);
-            } else if app.map.preview_attempt != Some(key) {
+            } else if app.map.preview_attempt != Some(key) && !reprojects {
                 // A small preview shows a visibility change immediately. The exact frame is
                 // already on its way. Even a failed preview is attempted only once per key.
                 app.map.preview_attempt = Some(key);
@@ -742,6 +807,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     if stale
         && !fast_engaged
         && !settling
+        && !hold
         && !draped
         && !tilt_draped
         && (motion.is_some()
@@ -768,7 +834,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let out = match (&app.map.gpu_renderer, &app.map.render_state) {
                 (Some(_), Some(_)) => {
                     let (out, s) = drawing(interacting, || {
-                        rustgis_engine::render::render_backend(app.session.map_mut(), &view, rustgis_engine::render::Backend::Gpu)
+                        rustgis_engine::render::render_backend(app.session.map_mut(), &view, rustgis_engine::render::Backend::GpuLive)
                     });
                     lacks = s;
                     out
@@ -827,7 +893,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             app.session.record_extent();
             app.map.camera_moved = false;
         }
-    } else if stale && !settling {
+    } else if stale && !settling && !hold {
         ui.ctx().request_repaint();
     }
 
@@ -853,13 +919,35 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // backend only serves flat maps, so the globe's drape never meets it.
     // Not under the tilted map's drape: a flat GPU frame from before the tilt would cover it.
     if let (Some(gf), Some(gr)) = (app.map.gpu_frame.as_ref().filter(|_| !tilt_draped), &app.map.gpu_renderer) {
+        // Live tile layers, placed for this frame's camera; drawn again while tiles are uploaded.
+        let (live_frame, live_pending) = match gf.live_frame(cam) {
+            Some((f, pending, declined)) => {
+                // A layer no longer drawn live (its style turned out to draw more than raster
+                // tiles): the map is drawn again, as tiles arriving would draw it.
+                if declined && app.map.live_rev.take().is_some() {
+                    ui.ctx().request_repaint();
+                }
+                (Some(f), pending)
+            }
+            None => (None, false),
+        };
+        let backlog = live_frame.is_some() && gr.live_backlog.load(std::sync::atomic::Ordering::Relaxed);
+        if backlog {
+            ui.ctx().request_repaint();
+        }
+        // A scene whose tiles are all live is never drawn again for tiles arriving: whether the
+        // map is still filling in is this frame's (tiles on their way, pictures to upload).
+        if gf.tiles_live {
+            app.map.filling = (live_pending || backlog) && !moving && app.ws.playing.is_none();
+        }
         painter.add(egui_wgpu::Callback::new_paint_callback(
             rect,
             crate::mapgpu::SceneCallback {
                 renderer: gr.clone(),
                 buffers: gf.clone(),
                 target: app.map.gpu_target.clone(),
-                uv: if gpu_ok && cam.bearing == 0.0 && cam.pitch == 0.0 && gf.has_images {
+                // A scene drawn for another size (a pane being dragged) is placed as a picture too.
+                uv: if gpu_ok && cam.bearing == 0.0 && cam.pitch == 0.0 && (gf.has_images || gf.size != [w, h]) {
                     Rect::from_min_max(
                         ((rect.min - tex_rect.min) / tex_rect.size()).to_pos2(),
                         ((rect.max - tex_rect.min) / tex_rect.size()).to_pos2(),
@@ -867,6 +955,8 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 } else {
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))
                 },
+                live: live_frame,
+                repaint: Some(ui.ctx().clone()),
             },
         ));
     } else if let Some(tex) = app.map.texture.as_ref().filter(|_| !draped && !tilt_draped) {
@@ -941,6 +1031,7 @@ fn show_gpu_frame(app: &mut RustGisApp, scene: rustgis_engine::render::gpu_scene
     ) else {
         return false;
     };
+    app.map.live_rev = bufs.tiles_live.then_some(key.rev);
     app.map.gpu_frame = Some(std::sync::Arc::new(bufs));
     app.map.labels = scene.labels;
     app.map.labels.splice(0..0, scene.unplaced);
@@ -1016,6 +1107,9 @@ fn show_frame(
 /// How much wider and taller than the view a frame drawn mid-motion to fill a gap is, so the
 /// next steps of zooming out or panning are covered too.
 const GAP_SPAN: f64 = 1.5;
+
+/// How long (s) the view's size holds before the map is drawn at it again (see `hold`).
+const RESIZE_SETTLE: f64 = 0.15;
 
 /// How long (ms) a frame drawn mid-motion may take before it is drawn coarser: about two
 /// 60 Hz frames, so a pan or zoom that redraws stays smooth.
@@ -2497,6 +2591,8 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let w = crate::widgets::text_w(ui, n, regular(12.0)) + 46.0 + TAB_CLOSE_W;
         let tr = Rect::from_min_size(pos2(x, r.min.y + 4.0), vec2(w, r.height() - 4.0));
         let resp = ui.interact(tr, egui::Id::new(("maptab", i)), Sense::click());
+        // Painted, so named for screen readers (and tests).
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, n));
         let is = i == active;
         // A project keeps at least one map (`map.remove` refuses the last).
         let last = names.len() < 2;
@@ -2529,6 +2625,11 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let _ = app.run("map.activate", json!({"name": n}));
             app.map.popup = None;
         }
+        // Right-click for the map's menu, as in the Browser; double-click renames.
+        if resp.double_clicked() {
+            let _ = app.run("ui.dialog", json!({"name": "renameMap", "target": n}));
+        }
+        resp.context_menu(|ui| crate::panes::map_menu(app, ui, n));
         x += w + 2.0;
     }
     // Layouts, after the maps.
@@ -2537,6 +2638,7 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let w = crate::widgets::text_w(ui, n, regular(12.0)) + 46.0 + TAB_CLOSE_W;
         let tr = Rect::from_min_size(pos2(x, r.min.y + 4.0), vec2(w, r.height() - 4.0));
         let resp = ui.interact(tr, egui::Id::new(("layouttab", i)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, n));
         let is = app.session.active_layout == Some(i) && !app.mb.shown();
         if is {
             ui.painter().rect_filled(tr, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, t.ribbon);
@@ -2571,6 +2673,10 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let _ = app.run("layout.activate", json!({"name": n}));
             app.ui.tab = "Publish".into();
         }
+        if resp.double_clicked() {
+            let _ = app.run("ui.dialog", json!({"name": "renameLayout", "target": n}));
+        }
+        resp.context_menu(|ui| crate::panes::layout_menu(app, ui, n));
         x += w + 2.0;
     }
     // ModelBuilder, after the layouts.
@@ -2794,6 +2900,42 @@ mod tests {
         h.state_mut().run("layer.visibility", json!({"layer": "Countries", "visible": false})).expect("hide countries");
         h.step();
         assert!(h.state().map.labels.is_empty(), "the preview kept labels from the old visibility state");
+    }
+
+    /// Dragging a side pane resizes the map view every frame. The map is not drawn again for
+    /// each size, which made the drag stutter: the last frame stays until the size holds, then
+    /// the map is drawn once at it.
+    #[test]
+    fn a_pane_drag_draws_the_map_once_it_stops() {
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(1200.0, 700.0)).with_step_dt(1.0 / 60.0).with_max_steps(10_000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                RustGisApp::with_sample(),
+            );
+        let settled = |h: &mut egui_kittest::Harness<'_, RustGisApp>, what: &str| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while h.state().map.key.is_none_or(|k| k.draft || k.size != h.state().map.view_px) || h.state().map.drawing() {
+                assert!(std::time::Instant::now() < end, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                h.step();
+            }
+        };
+        settled(&mut h, "the first frame did not arrive");
+        let before = h.state().map.key.map(|k| k.size);
+        // The window narrowing a little each frame, as the map does while a pane is dragged:
+        // 5 frames at 1/60 s each, well inside `RESIZE_SETTLE`.
+        for i in 1..=5 {
+            h.set_size(vec2(1200.0 - 10.0 * i as f32, 700.0));
+            h.step();
+            assert_eq!(h.state().map.key.map(|k| k.size), before, "the map was drawn again mid-drag (frame {i})");
+        }
+        // Held still: drawn at the new size.
+        settled(&mut h, "the map was not drawn once the drag stopped");
+        assert_ne!(h.state().map.key.map(|k| k.size), before);
     }
 
     /// Frames drawn mid-motion stay at full resolution unless the map draws slowly, and even

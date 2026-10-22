@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustgis_data::raster::{self, Raster};
+use rustgis_geom::Extent;
 use rustgis_map::raster::{RasterLayer, RasterMask, RasterRenderer, RasterStyle, Resampling, Stretch, classify_masked, unique_values};
 use rustgis_map::{ClassMethod, Ramp, RasterDefaults};
 use serde_json::{Value, json};
@@ -29,7 +30,7 @@ pub(crate) fn need_raster(s: &Session) -> Option<&'static str> {
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes)
-            .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles", "data": base64, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"? (as layer.addData)}"#),
+            .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles", "data": base64, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData)}"#),
         C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).params(
             r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "grey"?: bool (shadedRelief without its colour ramp)}"#,
         ),
@@ -129,7 +130,7 @@ pub fn commands() -> Vec<C> {
         ),
         C::new("raster.info", "Raster Information", "Data › Information", info).view().when(need_raster).params(r#"{"layer"?}"#),
         C::new("share.exportRaster", "Export Raster", "Data › Information", export).view().when(need_raster).params(
-            r#"{"layer"?, "path": "*.tif", "band"?: 1.. (rasters that aren't colour ones; a colour raster writes its colour bands)}"#,
+            r#"{"layer"?, "path": "*.tif", "band"?: 1.. (rasters that aren't colour ones; a colour raster writes its colour bands), "cog"?: bool (a cloud-optimised GeoTIFF: 512 px tiles, Deflate, overviews; default false, an untiled GeoTIFF)}"#,
         ),
     ]
 }
@@ -241,6 +242,14 @@ pub fn default_style_json(d: &RasterDefaults) -> Value {
 /// for a single band of continuous values takes the session's default raster style instead:
 /// opened files and analysis results (a slope, an NDVI) alike, since every producer adds here.
 pub fn add_raster(s: &mut Session, name: &str, mut layer: RasterLayer) -> CmdResult {
+    // A scan has no coordinates: it is laid over what the view shows, and says so.
+    let mut laid = None;
+    if let Some(d) = layer.data.as_mut().filter(|d| !d.georeferenced) {
+        let bbox = scan_box(s, d.width, d.height);
+        Arc::make_mut(d).place(bbox).map_err(|e| format!("{name}: {e}"))?;
+        layer.placement = Some(bbox);
+        laid = Some(bbox);
+    }
     if let Some(d) = layer.data.clone()
         && s.raster_defaults != RasterDefaults::default()
         && layer.style == RasterStyle::default_for(&d)
@@ -264,6 +273,13 @@ pub fn add_raster(s: &mut Session, name: &str, mut layer: RasterLayer) -> CmdRes
         s.zoom_to(&e);
     }
     let mut v = json!({"layer": id, "width": w, "height": h, "bands": n});
+    if let Some(bbox) = laid {
+        let note = "it has no coordinates, so it is drawn over the current view until it is georeferenced";
+        s.notify(format!("{unique}: {note}"), false);
+        v["georeferenced"] = json!(false);
+        v["placedOver"] = json!(bbox);
+        v["note"] = json!(note);
+    }
     // Callers that only read the result (the MCP server, scripts) learn about the overview too.
     if let (Some(o), Some((fw, fh))) = (v.as_object_mut(), overview) {
         o.insert("overviewOf".into(), json!([fw, fh]));
@@ -271,9 +287,51 @@ pub fn add_raster(s: &mut Session, name: &str, mut layer: RasterLayer) -> CmdRes
     Ok(v)
 }
 
+/// The longitude/latitude box (west, south, east, north) a scan of `w` × `h` pixels is laid over:
+/// the largest one in the view, centred, at the picture's shape and 90% of the view's size.
+fn scan_box(s: &Session, w: u32, h: u32) -> [f64; 4] {
+    let mut view = super::workspace::view_extent(s);
+    if view.is_empty() || view.width() <= 0.0 || view.height() <= 0.0 {
+        view = Extent::new(-30.0, -20.0, 30.0, 20.0);
+    }
+    let c = view.center();
+    // A degree of latitude is longer than one of longitude by 1 / cos(latitude) on the map.
+    let squash = c.y.to_radians().cos().abs().max(0.05);
+    let (aw, ah) = (f64::from(w.max(1)), f64::from(h.max(1)));
+    let across = (view.width() * 0.9).min(view.height() * 0.9 * aw / (ah * squash));
+    let up = across * ah * squash / aw;
+    [c.x - across / 2.0, c.y - up / 2.0, c.x + across / 2.0, c.y + up / 2.0]
+}
+
+/// Whether `"as": "scan"` was given for a TIFF, PNG or JPEG named `name`.
+pub(crate) fn wants_scan(p: &Value, name: &str) -> Result<bool, String> {
+    if !as_scan(p)? {
+        return Ok(false);
+    }
+    let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if matches!(ext.as_str(), "tif" | "tiff" | "png" | "jpg" | "jpeg") {
+        Ok(true)
+    } else {
+        Err(format!("{name}: \"as\": \"scan\" opens a TIFF, PNG or JPEG"))
+    }
+}
+
+/// Whether `"as"` asks for a scan, before any file is known: absent or null is no, `"scan"` is
+/// yes, and anything else (another word, a number) is refused rather than ignored.
+pub(crate) fn as_scan(p: &Value) -> Result<bool, String> {
+    match p.get("as") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(s)) if s == "scan" => Ok(true),
+        Some(other) => Err(format!("unknown \"as\": {other} (\"scan\")")),
+    }
+}
+
 /// Opens a raster file by path.
-pub fn add_path(s: &mut Session, path: &str, name: Option<&str>) -> CmdResult {
-    let r = raster::read_path(Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool) -> CmdResult {
+    let mut r = raster::read_path(Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+    if scan {
+        r = r.into_scan().map_err(|e| format!("{path}: {e}"))?;
+    }
     let name = name.map(str::to_string).unwrap_or_else(|| r.name.clone());
     // Absolute, so the project finds it again from anywhere (`absolute`, unlike `canonicalize`,
     // gives plain paths on Windows rather than `\\?\` ones).
@@ -322,12 +380,16 @@ fn add_bytes(s: &mut Session, p: &Value) -> CmdResult {
 pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: Vec<u8>) -> CmdResult {
     // A geotagged photo (an upload, a drop): a point in the photo layer, so several uploads
     // gather in one.
-    if rustgis_data::photo::is_photo_name(&name) {
+    let scan = wants_scan(p, &name)?;
+    if !scan && rustgis_data::photo::is_photo_name(&name) {
         let layer = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(super::layer::PHOTOS).to_string();
         return super::layer::add_photos_to(s, &layer, |reader| reader.add(&name, &bytes));
     }
     if raster::is_raster_name(&name) {
-        let r = raster::read_bytes(&name, &bytes).map_err(|e| format!("{name}: {e}"))?;
+        let mut r = raster::read_bytes(&name, &bytes).map_err(|e| format!("{name}: {e}"))?;
+        if scan {
+            r = r.into_scan().map_err(|e| format!("{name}: {e}"))?;
+        }
         let title = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| r.name.clone());
         return add_raster(s, &title, RasterLayer::from_bytes(r, name, bytes));
     }
@@ -555,6 +617,7 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
             "validPixels": b.stats.count, "distinctValues": b.stats.categories.as_ref().map(Vec::len),
         })).collect::<Vec<_>>(),
         "dataType": r.data_type,
+        "georeferenced": r.georeferenced,
         "noData": r.nodata,
         "crs": r.crs.label(),
         "cellSize": [cx, cy],
@@ -565,28 +628,40 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
     }))
 }
 
-/// GeoTIFF bytes of a raster layer (band is 1-based; RGB rasters keep their colour bands).
+/// GeoTIFF bytes of a raster layer (band is 1-based; RGB rasters keep their colour bands; `cog`
+/// makes it a cloud-optimised one).
 pub fn geotiff_bytes(s: &Session, p: &Value) -> Result<(String, Vec<u8>), String> {
     let (_, r) = get(s, p)?;
     let bi = band(p, "band", &r)?.unwrap_or(0);
-    let bytes = raster::geotiff::write(&r, bi).map_err(|e| e.to_string())?;
-    Ok((r.name.clone(), bytes))
+    let bytes = if b(p, "cog") == Some(true) { raster::cogwrite::write(&r, bi) } else { raster::geotiff::write(&r, bi) };
+    Ok((r.name.clone(), bytes.map_err(|e| e.to_string())?))
 }
 
 fn export(s: &mut Session, p: &Value) -> CmdResult {
     let path = ps(p, "path").ok_or("path is required")?.to_string();
-    let (_, bytes) = geotiff_bytes(s, p)?;
-    rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
     let (_, r) = get(s, p)?;
+    let mut cog = None;
+    if b(p, "cog") == Some(true) {
+        // Tiles go to the file as they are made: the whole file is never held in memory.
+        let bi = band(p, "band", &r)?.unwrap_or(0);
+        cog = Some(raster::cogwrite::write_file(&r, bi, Path::new(&path)).map_err(|e| format!("{path}: {e}"))?);
+    } else {
+        let (_, bytes) = geotiff_bytes(s, p)?;
+        rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+    }
     let note = match r.overview {
         Some((fw, fh)) => format!(" (the {} × {} overview of the {fw} × {fh} raster)", r.width, r.height),
         None => String::new(),
     };
     s.notify(format!("Exported {path}{note}"), false);
-    Ok(match r.overview {
+    let mut v = match r.overview {
         Some((fw, fh)) => json!({"path": path, "width": r.width, "height": r.height, "overviewOf": [fw, fh]}),
         None => json!({"path": path}),
-    })
+    };
+    if let (Some(o), Some(c)) = (v.as_object_mut(), cog) {
+        o.insert("cog".into(), json!({"overviews": c.levels.len().saturating_sub(1), "bigTiff": c.big, "bytes": c.bytes}));
+    }
+    Ok(v)
 }
 
 /// Pixel values of the topmost visible raster under a longitude/latitude point.

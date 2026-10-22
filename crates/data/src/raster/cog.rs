@@ -311,7 +311,7 @@ pub fn layout(bytes: &Sparse) -> Result<Parse> {
 fn read_layout(r: Sparse) -> Result<Parse> {
     let mut dec = Decoder::new(super::geotiff::reader(r).map_err(err)?).map_err(err)?.with_limits(limits());
     let Some(geo) = super::geotiff::cog_geo(&mut dec)? else {
-        return Ok(Parse::NotTiled("a rotated image is read whole".into()));
+        return Ok(Parse::NotTiled("a rotated image, or one without coordinates, is read whole".into()));
     };
     let ct = dec.colortype().map_err(err)?;
     let (bands, color) = match ct {
@@ -322,7 +322,10 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             (3, ColorHint::Rgb { alpha: false })
         }
         ColorType::RGBA(_) => (4, ColorHint::Rgb { alpha: true }),
-        ColorType::Multiband { num_samples, .. } => (num_samples.max(1) as usize, ColorHint::Gray),
+        ColorType::Multiband { num_samples, .. } => {
+            let color = super::geotiff::multiband_color(&mut dec, num_samples);
+            (num_samples.max(1) as usize, color)
+        }
         other => return Ok(Parse::NotTiled(format!("{other:?} images are read whole"))),
     };
     // Bands stored apart: each band of a tile is a chunk of its own.

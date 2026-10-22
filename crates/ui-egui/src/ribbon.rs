@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 
 use crate::theme::{Tokens, regular, semibold};
 use crate::widgets::{
-    CONTENT_H, LABEL_H, big, big_form_menu, big_menu, col, group, menu_item, small, small_form_menu, small_menu, submenu_row, text_w,
+    CONTENT_H, Dragged, LABEL_H, big, big_form_menu, big_menu, col, group, menu_item, small, small_form_menu, small_menu, submenu_row,
+    text_w,
 };
 use crate::{RightPane, RustGisApp, icons};
 
@@ -176,7 +177,7 @@ fn tool_indicator(app: &RustGisApp, ui: &Ui) -> Option<(String, f32)> {
     if tool == Tool::Explore {
         return None;
     }
-    let label = crate::i18n::fmt("{tool} tool active · Esc to stop", &[("tool", tl!(tool.label()))]);
+    let label = crate::i18n::fmt("{tool} tool active · Esc to stop", &[("tool", tl_raw!(tool.label()))]);
     let w = text_w(ui, &label, regular(11.5)) + 18.0;
     Some((label, w))
 }
@@ -647,7 +648,7 @@ fn planet_basemaps(ui: &mut Ui, app: &mut RustGisApp) {
         return;
     }
     ui.add_space(4.0);
-    let shown: Vec<String> = app.session.map().tiles.iter().filter(|l| !l.overlay && l.visible).map(|l| l.id.clone()).collect();
+    let shown: Vec<String> = app.session.map().tiles.iter().filter(|l| !l.overlay && l.draws()).map(|l| l.id.clone()).collect();
     egui::Grid::new("planet-basemaps").spacing(vec2(6.0, 4.0)).show(ui, |ui| {
         for (i, m) in rustgis_engine::map::planets::basemaps_of(body.id).enumerate() {
             let sel = shown.first().map(String::as_str) == Some(m.id);
@@ -697,7 +698,7 @@ fn web_basemaps(ui: &mut Ui, app: &mut RustGisApp, t: &Tokens) {
         ui.data_mut(|d| d.insert_persisted(stack_id, stack));
     }
     // The web basemaps showing: the one on top, or every one when stacking.
-    let shown: Vec<String> = app.session.map().tiles.iter().filter(|l| !l.overlay && l.visible).map(|l| l.id.clone()).collect();
+    let shown: Vec<String> = app.session.map().tiles.iter().filter(|l| !l.overlay && l.draws()).map(|l| l.id.clone()).collect();
     egui::Grid::new("web-basemaps").spacing(vec2(6.0, 4.0)).show(ui, |ui| {
         for (i, (id, name, kind, url, attribution, max_zoom)) in WEB_BASEMAPS.into_iter().enumerate() {
             let sel = if stack { shown.iter().any(|s| s == id) } else { shown.first().map(String::as_str) == Some(id) };
@@ -1904,6 +1905,16 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 Value::Null,
                 app.ui.right == Some(RightPane::Bookmarks),
             );
+            small(
+                ui,
+                app,
+                "label",
+                "Labeling",
+                "Show the Labeling pane for the selected layer.",
+                "ui.pane.labeling",
+                Value::Null,
+                app.ui.right == Some(RightPane::Labeling),
+            );
         });
         small(
             ui,
@@ -2004,7 +2015,7 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 ui.separator();
                 for n in ["Mapping", "Editing", "Analysis"] {
-                    if ui.button(crate::i18n::fmt("Save as {name}", &[("name", tl!(n))])).clicked() {
+                    if ui.button(crate::i18n::fmt("Save as {name}", &[("name", tl_raw!(n))])).clicked() {
                         let _ = app.run("ui.paneSet", json!({"save": tl!(n)}));
                         ui.close();
                     }
@@ -2804,6 +2815,8 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
             if small(ui, app, "g_ellipse", "Ellipse", "Add an ellipse.", "ui.menu", Value::Null, false).clicked() {
                 add(app, json!({"kind": "ellipse"}));
             }
+        });
+        col(ui, |ui| {
             small_menu(ui, app, "g_line", "Line", "Add a straight line.", |ui, app| {
                 for d in rustgis_engine::map::layout::LineDir::ALL {
                     if ui.button(tl!(d.label())).clicked() {
@@ -2812,6 +2825,11 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
                     }
                 }
             });
+            // Pointing right; the round handle above it turns it any way.
+            let desc = "Add an arrow. Turn it with the round handle above it, or set its angle in its properties.";
+            if small(ui, app, "g_arrow", "Arrow", desc, "ui.menu", Value::Null, false).clicked() {
+                add(app, json!({"kind": "arrow", "angle": 0}));
+            }
         });
     });
     group(ui, "Text", |ui| {
@@ -3195,10 +3213,10 @@ fn help_tab(app: &mut RustGisApp, ui: &mut Ui) {
 // ---------------------------------------------------------------------------------------------
 // Style and Data groups for the selected layer
 
-const SCALES: [f64; 10] =
+pub(crate) const SCALES: [f64; 10] =
     [1_000.0, 10_000.0, 50_000.0, 100_000.0, 500_000.0, 1_000_000.0, 5_000_000.0, 10_000_000.0, 50_000_000.0, 100_000_000.0];
 
-fn scale_label(s: Option<f64>) -> String {
+pub(crate) fn scale_label(s: Option<f64>) -> String {
     match s {
         None => tl!("<None>").into(),
         Some(v) => format!("1:{}", fmt_thousands(v)),
@@ -3327,8 +3345,10 @@ fn effects_groups(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map
                     let mut k = xx.factor;
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(tl!("Factor")).size(11.5));
+                        // Kept across a drag until it is let go (#607).
+                        let drag = Dragged::lend(ui, egui::Id::new(("extrusion_factor", layer.id)), &mut k);
                         let r = ui.add(egui::DragValue::new(&mut k).range(0.0..=1e6).speed(xx.factor.max(0.0001) * 0.02));
-                        if r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged()) {
+                        if drag.settled(ui, &r, &mut k) && k != xx.factor {
                             let t = if xx.field.is_some() { "field" } else { "height" };
                             let _ = app.run("layer.extrusion", json!({"type": t, "field": xx.field, "factor": k}));
                         }
@@ -3765,8 +3785,10 @@ fn raster_style_groups(app: &mut RustGisApp, ui: &mut Ui) {
             mask_menu(ui, app, &layer);
             let mut a = style.rotation;
             ui.horizontal(|ui| {
+                // Kept across a drag until it is let go (#607).
+                let drag = Dragged::lend(ui, egui::Id::new(("raster_rotation", layer.id)), &mut a);
                 let r = ui.add(egui::DragValue::new(&mut a).range(0.0..=359.0).speed(1.0).suffix("°"));
-                if r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged()) {
+                if drag.settled(ui, &r, &mut a) && a != style.rotation {
                     let _ = app.run("raster.rotation", json!({"angle": a}));
                 }
                 ui.label(egui::RichText::new(tl!("Rotation")).size(11.5));
@@ -3964,11 +3986,24 @@ fn label_groups(app: &mut RustGisApp, ui: &mut Ui) {
     group(ui, "Labels", |ui| {
         let on = layer.labels.enabled;
         big(ui, app, if on { "label" } else { "label_off" }, "Label", "Turn labels on or off.", "labels.enable", Value::Null, on, false);
+        big(
+            ui,
+            app,
+            "label_properties",
+            "Properties",
+            "Every label setting of this layer, in the Labeling pane.",
+            "ui.pane.labeling",
+            Value::Null,
+            app.ui.right == Some(RightPane::Labeling),
+            false,
+        );
     });
     group(ui, "Label Range", |ui| {
         ui.vertical(|ui| {
             ui.add_space(6.0);
-            for (label, cur, key) in [("Out Beyond", layer.labels.min_scale, "min"), ("In Beyond", layer.labels.max_scale, "max")] {
+            for (label, cur, key) in
+                [("Out Beyond", layer.labels.default.min_scale, "min"), ("In Beyond", layer.labels.default.max_scale, "max")]
+            {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(tl!(label)).size(11.5));
                     egui::ComboBox::from_id_salt(format!("label_scale_{key}")).selected_text(scale_label(cur)).width(118.0).show_ui(
@@ -3988,8 +4023,8 @@ fn label_groups(app: &mut RustGisApp, ui: &mut Ui) {
         });
         col(ui, |ui| {
             for (label, cur, key, desc) in [
-                ("Closest", layer.labels.closest, "closest", "Hide labels when the viewer is closer than this."),
-                ("Farthest", layer.labels.farthest, "farthest", "Hide labels when the viewer is farther than this."),
+                ("Closest", layer.labels.default.closest, "closest", "Hide labels when the viewer is closer than this."),
+                ("Farthest", layer.labels.default.farthest, "farthest", "Hide labels when the viewer is farther than this."),
             ] {
                 small_menu(ui, app, "eye", label, desc, |ui, app| {
                     for d in [None, Some(1_000.0), Some(10_000.0), Some(100_000.0), Some(1_000_000.0), Some(10_000_000.0)] {
@@ -4014,7 +4049,7 @@ fn label_groups(app: &mut RustGisApp, ui: &mut Ui) {
         });
     });
     group(ui, "Label Placement", |ui| {
-        let cur = layer.labels.placement;
+        let cur = layer.labels.default.placement;
         big_menu(ui, app, "placement", "Placement", "Where labels sit relative to their features.", |ui, app| {
             for pl in rustgis_engine::map::LabelPlacement::ALL {
                 if ui.radio(cur == pl, tl!(pl.label())).clicked() {
@@ -4028,7 +4063,7 @@ fn label_groups(app: &mut RustGisApp, ui: &mut Ui) {
         ui.vertical(|ui| {
             ui.add_space(8.0);
             let fields: Vec<String> = layer.dataset.fields.iter().map(|f| f.name.clone()).collect();
-            if let Some(f) = crate::widgets::ribbon_combo(ui, "label_field", "Field", &layer.labels.field, &fields, 140.0) {
+            if let Some(f) = crate::widgets::ribbon_combo(ui, "label_field", "Field", &layer.labels.default.field, &fields, 140.0) {
                 let _ = app.run("labels.field", json!({"field": f}));
             }
         });
@@ -4036,7 +4071,7 @@ fn label_groups(app: &mut RustGisApp, ui: &mut Ui) {
     group(ui, "Text Symbol", |ui| {
         col(ui, |ui| {
             // The whole range `labels.style` accepts (#457), so a larger label isn't cut back.
-            let mut size = f64::from(layer.labels.size);
+            let mut size = f64::from(layer.labels.default.size);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tl!("Size")).size(11.5));
                 let range = rustgis_engine::map::symbology::LABEL_SIZE;
@@ -4044,7 +4079,7 @@ fn label_groups(app: &mut RustGisApp, ui: &mut Ui) {
                     let _ = app.run("labels.style", json!({"size": size}));
                 }
             });
-            let mut c = crate::theme::c32(layer.labels.color);
+            let mut c = crate::theme::c32(layer.labels.default.color);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tl!("Color")).size(11.5));
                 if crate::widgets::color_button(ui, &mut c).changed() {
@@ -4053,7 +4088,16 @@ fn label_groups(app: &mut RustGisApp, ui: &mut Ui) {
             });
         });
         col(ui, |ui| {
-            small(ui, app, "label", "Bold", "Bold label text.", "labels.style", json!({"bold": !layer.labels.bold}), layer.labels.bold);
+            small(
+                ui,
+                app,
+                "label",
+                "Bold",
+                "Bold label text.",
+                "labels.style",
+                json!({"bold": !layer.labels.default.bold}),
+                layer.labels.default.bold,
+            );
             small(
                 ui,
                 app,
@@ -4061,8 +4105,8 @@ fn label_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 "Halo",
                 "Draw a halo around label text.",
                 "labels.style",
-                json!({"halo": !layer.labels.halo}),
-                layer.labels.halo,
+                json!({"halo": !layer.labels.default.halo}),
+                layer.labels.default.halo,
             );
         });
     });

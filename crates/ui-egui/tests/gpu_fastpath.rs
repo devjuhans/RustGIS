@@ -7,15 +7,32 @@
 use rustgis_ui_egui::RustGisApp;
 use serde_json::{Value, json};
 
+/// The tile cache and the streamed layers' reads are global: their generations are part of
+/// what a frame was drawn for, so a tile another test fetched, arriving mid-motion, draws the
+/// map again. The tests here run one at a time.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn wait_for_frame(h: &mut egui_kittest::Harness<'_, RustGisApp>) {
-    for _ in 0..40 {
-        h.step();
-    }
+    use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache;
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while h.state().map.drawing() {
-        assert!(std::time::Instant::now() < end, "frame worker did not finish");
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        h.step();
+    // Tiles still arriving would draw the map again: until none arrived since the last frames.
+    loop {
+        assert!(std::time::Instant::now() < end, "tiles kept arriving");
+        let tiles = cache::generation();
+        for _ in 0..40 {
+            h.step();
+        }
+        while h.state().map.drawing() || cache::in_flight() > 0 {
+            assert!(std::time::Instant::now() < end, "frame worker did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            h.step();
+        }
+        if cache::generation() == tiles {
+            break;
+        }
     }
 }
 
@@ -62,6 +79,7 @@ fn harness() -> Option<egui_kittest::Harness<'static, RustGisApp>> {
 
 #[test]
 fn settling_after_a_camera_animation_re_renders_fully() {
+    let _serial = one_at_a_time();
     let Some(mut h) = harness() else { return };
     for _ in 0..6 {
         h.step();
@@ -120,6 +138,7 @@ fn assert_gpu_picture_matches_cpu(h: &mut egui_kittest::Harness<'_, RustGisApp>)
 #[test]
 fn zooming_a_planet_with_raster_tiles_reuses_the_gpu_frame() {
     use rustgis_ui_egui::rustgis_engine::map::{TileKind, TileLayer};
+    let _serial = one_at_a_time();
     serve_planet_tiles();
     let Some(mut h) = harness() else { return };
     h.state_mut().run("map.body", json!({"name": "moon", "basemap": false})).expect("Moon");
@@ -148,7 +167,12 @@ fn zooming_a_planet_with_raster_tiles_reuses_the_gpu_frame() {
     assert_eq!(h.state().map.full_frame_camera(), before, "navigation must reuse the uploaded image instead of redrawing every frame");
     assert_gpu_picture_matches_cpu(&mut h);
     wait_for_frame(&mut h);
-    assert_eq!(h.state().map.full_frame_camera(), h.state().session.map().camera, "settling sharpens the image");
+    // Live tiles are placed for every frame: sharp at rest without drawing the scene again (#635).
+    if h.state().map.shows_live_tiles() {
+        assert_gpu_picture_matches_cpu(&mut h);
+    } else {
+        assert_eq!(h.state().map.full_frame_camera(), h.state().session.map().camera, "settling sharpens the image");
+    }
     // Start from a CPU preview, then force the first GPU frame to fill a pan gap. Its
     // oversized picture must use cropped UVs immediately, including this very first frame.
     h.state_mut().map.invalidate();
@@ -173,6 +197,7 @@ fn planet_layer_toggles_show_in_the_next_frame_and_stale_jobs_do_not_restore_the
         data::{GeometryType, io::read_geojson},
         map::{Renderer, Rgba, Symbol, TileKind, TileLayer},
     };
+    let _serial = one_at_a_time();
     serve_planet_tiles();
     let Some(mut h) = harness() else { return };
     h.state_mut().run("map.body", json!({"name": "moon", "basemap": false})).expect("Moon");
@@ -214,6 +239,7 @@ fn planet_layer_toggles_show_in_the_next_frame_and_stale_jobs_do_not_restore_the
 #[test]
 fn tiled_camera_playback_does_not_start_settling_jobs() {
     use rustgis_ui_egui::rustgis_engine::map::{TileKind, TileLayer};
+    let _serial = one_at_a_time();
     serve_planet_tiles();
     for gpu in [false, true] {
         let Some(mut h) = harness() else { return };
@@ -247,6 +273,7 @@ fn tiled_camera_playback_does_not_start_settling_jobs() {
 #[test]
 fn raster_tiles_move_with_the_camera_on_the_gpu() {
     use rustgis_ui_egui::rustgis_engine::map::{TileKind, TileLayer};
+    let _serial = one_at_a_time();
     serve_planet_tiles();
     let Some(mut h) = harness() else { return };
     let m = h.state_mut().session.map_mut();
@@ -283,7 +310,10 @@ fn raster_tiles_move_with_the_camera_on_the_gpu() {
         }
         wheel(&mut h, 1);
     }
-    assert_ne!(h.state().map.full_frame_camera(), before, "zoomed in past the tiles' own zoom, the new zoom's tiles are placed");
+    // Live tiles take the new zoom's tiles in the same scene (#635); otherwise a new scene does.
+    if !h.state().map.shows_live_tiles() {
+        assert_ne!(h.state().map.full_frame_camera(), before, "zoomed in past the tiles' own zoom, the new zoom's tiles are placed");
+    }
     assert!(h.state().map.moves_on_gpu());
     assert_gpu_picture_matches_cpu(&mut h);
 }

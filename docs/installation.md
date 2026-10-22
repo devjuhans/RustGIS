@@ -37,6 +37,10 @@ On macOS the command line tool is a separate `rustgis-cli-<version>-macos-<arch>
 the other packages include it (the Windows installers and the MSIX add `rustgis-cli` to every
 new terminal). `SHA256SUMS` lists the checksum of every file.
 
+The AppImages carry update information, so tools such as Gear Lever can update them to the
+latest release. AppImageUpdate, and AppImageLauncher through the AppImageUpdate library, download
+only the parts that changed, with the `.zsync` file published beside each AppImage.
+
 On Windows, `setup.exe` installs for your account in `%LOCALAPPDATA%\Programs\RustGIS` and needs
 no admin rights; the `.msi` installs for every user in `Program Files` and suits managed
 deployment (`msiexec /i RustGIS-<version>-windows-x86_64.msi /qn`). Both add a Start menu
@@ -118,8 +122,9 @@ The web app opens the way **Settings › Start-up** says (remembered in the brow
 override that for one visit: add `?blank` to start with an empty project,
 `?projection=EPSG:3010` (a supported projected EPSG or ESRI code, a preset id such as `robinson`, or `globe`) to
 start in another projection, `?extent=10.5,55,24.5,69.5` (west, south, east, north in degrees) to
-open on an area, `?lang=de` (or any language code) to pick the interface language, or `?webgl` to
-force WebGL2. Combine them with `&`, so a self-hosted build can link to
+open on an area, `?lang=de` (or any language code) to pick the interface language, `?gpu` (or
+`?gpu=0`) to turn GPU Rendering on (off) for the visit, or `?webgl` to force
+WebGL2. Combine them with `&`, so a self-hosted build can link to
 `?blank&projection=EPSG:3010&extent=10.5,55,24.5,69.5`.
 
 Links can carry data too: `?data=<address>` adds a file by its web address (any format Add Data

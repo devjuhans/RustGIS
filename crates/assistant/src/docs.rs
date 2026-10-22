@@ -47,6 +47,7 @@ pub const PAGES: &[Page] = pages![
     "contributing.md",
     "sponsor.md",
     "privacy.md",
+    "acknowledgements.md",
 ];
 
 /// Default maximum lines per documentation read, following Pi’s read-tool convention.

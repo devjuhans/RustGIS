@@ -222,6 +222,7 @@ fn every_tab_pane_and_dialog_renders() {
     }
     for (id, p) in [
         ("ui.pane.symbology", json!(null)),
+        ("ui.pane.labeling", json!({"layer": "Cities"})),
         ("ui.pane.geoprocessing", json!(null)),
         ("ui.gp.open", json!({"tool": "buffer"})),
         ("ui.pane.history", json!(null)),
@@ -2135,4 +2136,37 @@ fn geometry_calculator_switching_back_creates_a_unique_field() {
     let new = ds.field_index("x_deg_2").expect("a unique field should be created");
     assert_eq!(ds.value(0, old).as_f64(), Some(99.0));
     assert_eq!(ds.value(0, new).as_f64(), Some(117.0));
+}
+
+#[test]
+fn map_and_layout_tabs_rename_from_their_menus() {
+    let mut h = harness();
+    h.state_mut().run("ui.language", json!({"code":"en"})).unwrap();
+    h.state_mut().run("map.rename", json!({"name": "Tab Map"})).unwrap();
+    h.state_mut().run("layout.new", json!({"name": "Tab Layout"})).unwrap();
+    h.state_mut().run("layout.close", json!(null)).unwrap();
+    for (tab, new) in [("Tab Map", "Renamed Map"), ("Tab Layout", "Renamed Layout")] {
+        for _ in 0..4 {
+            h.step();
+        }
+        // The tab, not the map's name elsewhere in the window.
+        h.get_by(|n| n.role() == egui::accesskit::Role::Button && n.label().as_deref() == Some(tab)).click_secondary();
+        for _ in 0..4 {
+            h.step();
+        }
+        h.get_by_label("Rename…").click();
+        for _ in 0..4 {
+            h.step();
+        }
+        assert_eq!(h.state().dialogs.a, tab);
+        h.state_mut().dialogs.text = new.into();
+        h.get_by_label("Rename").click();
+        for _ in 0..4 {
+            h.step();
+        }
+        assert!(h.state().dialogs.open.is_none(), "{:?}", h.state().dialogs.error);
+    }
+    let p = &h.state().session.project;
+    assert_eq!(p.maps[0].name, "Renamed Map");
+    assert_eq!(p.layouts.last().map(|l| l.name.as_str()), Some("Renamed Layout"));
 }
