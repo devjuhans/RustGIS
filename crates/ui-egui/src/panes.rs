@@ -3200,13 +3200,16 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             ui.painter().text(pos2(r.center().x, r.max.y - 11.0), Align2::CENTER_CENTER, short, regular(11.0), t.text);
             if resp.on_hover_text(tl!(*label)).clicked() && !sel {
                 if *code == "unique" {
-                    if let Some(field) = all.first() {
-                        app.ui.symbology_pending = Some((l.id, field.clone()));
+                    let field = l.dataset.fields.iter().find(|f| !f.ty.is_numeric()).or_else(|| l.dataset.fields.first());
+                    if let Some(field) = field {
+                        app.ui.symbology_pending = Some((l.id, field.name.clone()));
                     } else {
                         let _ = app.run("layer.symbology", json!({"type": code}));
                     }
                 } else {
-                    let _ = app.run("layer.symbology", json!({"type": code}));
+                    if app.run("layer.symbology", json!({"type": code})).is_ok() {
+                        app.ui.symbology_pending = None;
+                    }
                 }
             }
         }
@@ -3222,10 +3225,10 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         ui.selectable_value(&mut selected, field.clone(), field);
                     }
                 });
-                if ui.button(tl!("Apply")).clicked() {
-                    if app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})).is_ok() {
-                        app.ui.symbology_pending = None;
-                    }
+                if ui.button(tl!("Apply")).clicked()
+                    && app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})).is_ok()
+                {
+                    app.ui.symbology_pending = None;
                 }
             });
             if selected != pending_field {
