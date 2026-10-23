@@ -3138,12 +3138,12 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         ui.label(egui::RichText::new(tl!("Select a layer in the Layers pane.")).color(t.text_dim));
         return;
     };
+    if app.ui.symbology_pending.as_ref().is_some_and(|(id, _)| *id != l.id) {
+        app.ui.symbology_pending = None;
+    }
     if l.is_raster() {
         raster_symbology(app, ui, &l, t);
         return;
-    }
-    if app.ui.symbology_pending.as_ref().is_some_and(|(id, _)| *id != l.id) {
-        app.ui.symbology_pending = None;
     }
     let g = l.geometry_type();
     let numeric: Vec<String> = l.dataset.fields.iter().filter(|f| f.ty.is_numeric()).map(|f| f.name.clone()).collect();
@@ -3206,10 +3206,8 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     } else {
                         let _ = app.run("layer.symbology", json!({"type": code}));
                     }
-                } else {
-                    if app.run("layer.symbology", json!({"type": code})).is_ok() {
-                        app.ui.symbology_pending = None;
-                    }
+                } else if app.run("layer.symbology", json!({"type": code})).is_ok() {
+                    app.ui.symbology_pending = None;
                 }
             }
         }
@@ -3225,15 +3223,14 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         ui.selectable_value(&mut selected, field.clone(), field);
                     }
                 });
-                if ui.button(tl!("Apply")).clicked()
-                    && app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})).is_ok()
-                {
+                let applied = ui.button(tl!("Apply")).clicked()
+                    && app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})).is_ok();
+                if applied {
                     app.ui.symbology_pending = None;
+                } else if selected != pending_field {
+                    app.ui.symbology_pending = Some((l.id, selected));
                 }
             });
-            if selected != pending_field {
-                app.ui.symbology_pending = Some((l.id, selected));
-            }
             ui.add_space(6.0);
         }
     }
