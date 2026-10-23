@@ -3213,26 +3213,26 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
     });
     ui.add_space(8.0);
-    if let Some((pending_id, pending_field)) = app.ui.symbology_pending.clone() {
-        if pending_id == l.id {
-            let mut selected = pending_field.clone();
-            ui.horizontal(|ui| {
-                ui.label(tl!("Field"));
-                egui::ComboBox::from_id_salt("sym_pending_field").selected_text(&selected).width(200.0).show_ui(ui, |ui| {
-                    for field in &all {
-                        ui.selectable_value(&mut selected, field.clone(), field);
-                    }
-                });
-                let applied = ui.button(tl!("Apply")).clicked()
-                    && app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})).is_ok();
-                if applied {
-                    app.ui.symbology_pending = None;
-                } else if selected != pending_field {
-                    app.ui.symbology_pending = Some((l.id, selected));
+    if let Some((pending_id, pending_field)) = app.ui.symbology_pending.clone()
+        && pending_id == l.id
+    {
+        let mut selected = pending_field.clone();
+        ui.horizontal(|ui| {
+            ui.label(tl!("Field"));
+            egui::ComboBox::from_id_salt("sym_pending_field").selected_text(&selected).width(200.0).show_ui(ui, |ui| {
+                for field in &all {
+                    ui.selectable_value(&mut selected, field.clone(), field);
                 }
             });
-            ui.add_space(6.0);
-        }
+            let applied = ui.button(tl!("Apply")).clicked()
+                && app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})).is_ok();
+            if applied {
+                app.ui.symbology_pending = None;
+            } else if selected != pending_field {
+                app.ui.symbology_pending = Some((l.id, selected));
+            }
+        });
+        ui.add_space(6.0);
     }
     match &l.renderer {
         Renderer::Single(s) => symbol_editor(app, ui, *s, g, t),
