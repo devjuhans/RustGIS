@@ -2830,6 +2830,26 @@ fn geometry_calculator_switching_back_creates_a_unique_field() {
 }
 
 #[test]
+fn unique_symbology_lets_the_user_choose_a_text_field_before_applying() {
+    use rustgis_ui_egui::rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    use rustgis_ui_egui::rustgis_engine::geom::Coord;
+
+    let mut h = harness();
+    let mut ds = Dataset::new("Text attributes", GeometryType::Point, vec![Field::new("category", FieldType::Text)]);
+    ds.push(Some(Geometry::Point(Coord::new(117.0, 3.0))), vec![Value::Text("village".into())]);
+    let id = h.state_mut().session.map_mut().add_dataset(ds);
+    h.state_mut().session.active_layer = Some(id);
+    h.state_mut().run("ui.pane.symbology", json!(null)).unwrap();
+    h.state_mut().ui.symbology_pending = Some((id, "category".into()));
+    h.step();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Apply").click();
+    h.step();
+    let layer = h.state().session.map().layer(id).unwrap();
+    assert!(matches!(layer.renderer, rustgis_ui_egui::rustgis_engine::map::Renderer::Unique { ref field, .. } if field == "category"));
+    assert_eq!(h.state().ui.symbology_pending, None);
+}
+
+#[test]
 fn map_and_layout_tabs_rename_from_their_menus() {
     let mut h = harness();
     h.state_mut().run("ui.language", json!({"code":"en"})).unwrap();

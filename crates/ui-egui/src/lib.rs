@@ -588,6 +588,8 @@ pub struct UiState {
     pub copy_image: Option<egui::ColorImage>,
     /// The scale being typed into the status bar, while its box has focus.
     pub scale_text: Option<String>,
+    /// A field chosen in the Symbology pane before applying Unique Values.
+    pub symbology_pending: Option<(u32, String)>,
 }
 
 impl UiState {
@@ -700,6 +702,7 @@ impl Default for UiState {
             layers_view: LayersView::DrawingOrder,
             dynamic_text: None,
             scale_text: None,
+            symbology_pending: None,
         }
     }
 }

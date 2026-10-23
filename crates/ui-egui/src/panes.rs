@@ -3142,7 +3142,12 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         raster_symbology(app, ui, &l, t);
         return;
     }
+    if app.ui.symbology_pending.as_ref().is_some_and(|(id, _)| *id != l.id) {
+        app.ui.symbology_pending = None;
+    }
     let g = l.geometry_type();
+    let numeric: Vec<String> = l.dataset.fields.iter().filter(|f| f.ty.is_numeric()).map(|f| f.name.clone()).collect();
+    let all: Vec<String> = l.dataset.fields.iter().map(|f| f.name.clone()).collect();
     ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
     ui.add_space(6.0);
     ui.label(egui::RichText::new(tl!("Primary symbology")).size(11.5).color(t.text_dim));
@@ -3194,13 +3199,41 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let short = tl!(label).split(' ').next().unwrap_or(label);
             ui.painter().text(pos2(r.center().x, r.max.y - 11.0), Align2::CENTER_CENTER, short, regular(11.0), t.text);
             if resp.on_hover_text(tl!(*label)).clicked() && !sel {
-                let _ = app.run("layer.symbology", json!({"type": code}));
+                if *code == "unique" {
+                    if let Some(field) = all.first() {
+                        app.ui.symbology_pending = Some((l.id, field.clone()));
+                    } else {
+                        let _ = app.run("layer.symbology", json!({"type": code}));
+                    }
+                } else {
+                    let _ = app.run("layer.symbology", json!({"type": code}));
+                }
             }
         }
     });
     ui.add_space(8.0);
-    let numeric: Vec<String> = l.dataset.fields.iter().filter(|f| f.ty.is_numeric()).map(|f| f.name.clone()).collect();
-    let all: Vec<String> = l.dataset.fields.iter().map(|f| f.name.clone()).collect();
+    if let Some((pending_id, pending_field)) = app.ui.symbology_pending.clone() {
+        if pending_id == l.id {
+            let mut selected = pending_field.clone();
+            ui.horizontal(|ui| {
+                ui.label(tl!("Field"));
+                egui::ComboBox::from_id_salt("sym_pending_field").selected_text(&selected).width(200.0).show_ui(ui, |ui| {
+                    for field in &all {
+                        ui.selectable_value(&mut selected, field.clone(), field);
+                    }
+                });
+                if ui.button(tl!("Apply")).clicked() {
+                    if app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})).is_ok() {
+                        app.ui.symbology_pending = None;
+                    }
+                }
+            });
+            if selected != pending_field {
+                app.ui.symbology_pending = Some((l.id, selected));
+            }
+            ui.add_space(6.0);
+        }
+    }
     match &l.renderer {
         Renderer::Single(s) => symbol_editor(app, ui, *s, g, t),
         Renderer::Unique { field, classes, ramp, .. } => {
