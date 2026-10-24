@@ -8,6 +8,7 @@ use std::ops::Range;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Stroke};
 use rustgis_engine::cmd::workflows::{MAX_SCRIPT_LINES, refused_in_script};
+use rustgis_engine::string_end;
 
 /// What a piece of a script is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,16 +123,8 @@ fn json_spans(text: &str, at: usize, broken: bool, out: &mut Vec<Span>) {
         let s = i;
         match c {
             b'"' => {
-                i += 1;
-                while let Some(&c) = b.get(i) {
-                    i += 1;
-                    match c {
-                        // The escaped char, whole: a multi-byte one isn't cut.
-                        b'\\' => i = next_char(text, i),
-                        b'"' => break,
-                        _ => {}
-                    }
-                }
+                // Past its closing quote, or to the end when nothing closes it.
+                i = text.get(i + 1..).and_then(string_end).map_or(text.len(), |n| i + n + 2);
                 // A key is a string with a colon after it.
                 let after = text.get(i..).map(str::trim_start);
                 // (A command's parameter description marks a key that may be left out with `?`:
@@ -170,11 +163,6 @@ fn json_spans(text: &str, at: usize, broken: bool, out: &mut Vec<Span>) {
             }
         }
     }
-}
-
-/// The byte after the char starting at `i` of `text` (its end when `i` is past it).
-fn next_char(text: &str, i: usize) -> usize {
-    text.get(i..).and_then(|t| t.chars().next()).map_or(text.len(), |c| i + c.len_utf8())
 }
 
 /// The colours of a script, one per kind. The theme's text, dimmed text and accent, and colours
@@ -267,7 +255,7 @@ pub type Cache = egui::cache::FrameCache<LayoutJob, Highlighter>;
 /// commands don't change while the app runs.
 pub fn unknown_ids_cached(ui: &egui::Ui, session: &rustgis_engine::Session, script: &str) -> std::sync::Arc<Vec<String>> {
     type Kept = (u64, u64, std::sync::Arc<Vec<String>>);
-    let key = egui::Id::new("script_unknown_ids");
+    let key = egui::Id::unique("script_unknown_ids");
     let (text, plugins) = (egui::util::hash(script), rustgis_engine::plugins::revision());
     if let Some((t, p, ids)) = ui.data(|d| d.get_temp::<Kept>(key))
         && (t, p) == (text, plugins)
@@ -441,7 +429,7 @@ mod tests {
         let mut app = crate::RustGisApp::with_sample();
         let script = "# zoom\nnope.cmd {\"a\": \"é\"}\nlabels.style {\"size\": }\n";
         app.workflow.script = script.into();
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(500.0, 400.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(egui::vec2(500.0, 400.0)).build_ui_state(
             |ui, app: &mut crate::RustGisApp| crate::analysispane::script_pane(app, ui, &crate::theme::Tokens::light()),
             app,
         );
@@ -492,7 +480,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::RustGisApp::with_sample();
         app.workflow.script = "map.zoomFull\n".repeat(300);
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(500.0, 700.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(egui::vec2(500.0, 700.0)).build_ui_state(
             |ui, app: &mut crate::RustGisApp| crate::analysispane::script_pane(app, ui, &crate::theme::Tokens::light()),
             app,
         );
@@ -508,7 +496,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::RustGisApp::with_sample();
         app.workflow.script = "map.zoomFull".into();
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(500.0, 700.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(egui::vec2(500.0, 700.0)).build_ui_state(
             |ui, app: &mut crate::RustGisApp| crate::analysispane::script_pane(app, ui, &crate::theme::Tokens::light()),
             app,
         );
@@ -534,14 +522,16 @@ mod tests {
         assert!(!underlined("map.zoomFull"), "a good id isn't");
     }
 
-    /// A run's results, however long, stay in view under the buttons, in a scroll of their own.
+    /// A run's results, however long, stay in view under the buttons, in a scroll of their own. The
+    /// line above them, the run and when it started, too.
     #[test]
     fn long_results_stay_in_view() {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::RustGisApp::with_sample();
         app.workflow.script = "map.zoomFull\n".repeat(300);
         app.workflow.script_out = (0..12).map(|i| (format!("line {i}: {}", "a long error ".repeat(30)), true)).collect();
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(500.0, 700.0)).build_ui_state(
+        app.workflow.script_last = Some(crate::analysispane::ScriptRun { n: 1, secs: 0.5, at: 1_800_000_000 });
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(egui::vec2(500.0, 700.0)).build_ui_state(
             |ui, app: &mut crate::RustGisApp| crate::analysispane::script_pane(app, ui, &crate::theme::Tokens::light()),
             app,
         );
@@ -549,6 +539,7 @@ mod tests {
         assert!(h.get_by_label("Run").rect().max.y < 700.0);
         let first = h.get_by_label_contains("line 0:").rect();
         assert!(first.min.y < 700.0, "the first result shows: {first:?}");
+        assert!(h.get_by_label_contains("Run #1 (").rect().max.y < first.min.y, "the run above them");
     }
 
     /// The kept unknown ids follow the script: a change is read again, the same script isn't.
@@ -574,7 +565,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::RustGisApp::with_sample();
         app.workflow.script = "map.zoomFull\n".repeat(300);
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(500.0, 150.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(egui::vec2(500.0, 150.0)).build_ui_state(
             |ui, app: &mut crate::RustGisApp| crate::analysispane::script_pane(app, ui, &crate::theme::Tokens::light()),
             app,
         );
@@ -604,7 +595,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::RustGisApp::with_sample();
         app.workflow.script = "map.zoomFull\n".repeat(30);
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(500.0, 700.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(egui::vec2(500.0, 700.0)).build_ui_state(
             |ui, app: &mut crate::RustGisApp| crate::analysispane::script_pane(app, ui, &crate::theme::Tokens::light()),
             app,
         );
