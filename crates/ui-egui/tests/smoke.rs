@@ -3078,7 +3078,7 @@ fn unique_symbology_lets_the_user_choose_a_text_field_before_applying() {
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Unique Values").click();
     h.step();
     assert_eq!(h.state().ui.symbology_pending.as_ref().map(|pending| pending.field.as_str()), Some("category"));
-    h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("category")).unwrap().click();
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Field").click();
     h.step();
     h.step(); // Combo popups enter the accessibility tree on the following frame.
     h.get_by_label("other").click();

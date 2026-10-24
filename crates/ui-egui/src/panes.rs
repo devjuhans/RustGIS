@@ -3500,12 +3500,17 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let pending_field = pending.field.clone();
         let mut selected = if all.contains(&pending_field) { pending_field.clone() } else { all.first().cloned().unwrap_or_default() };
         ui.horizontal(|ui| {
-            ui.label(tl!("Field"));
-            egui::ComboBox::from_id_salt("sym_pending_field").selected_text(&selected).width(200.0).show_ui(ui, |ui| {
-                for field in &all {
-                    ui.selectable_value(&mut selected, field.clone(), field);
-                }
-            });
+            let input_label = ui.label(tl!("Field"));
+            egui::ComboBox::from_id_salt("sym_pending_field")
+                .selected_text(&selected)
+                .width(200.0)
+                .show_ui(ui, |ui| {
+                    for field in &all {
+                        ui.selectable_value(&mut selected, field.clone(), field);
+                    }
+                })
+                .response
+                .labelled_by(input_label.id);
             let applied = ui.button(tl!("Apply")).clicked()
                 && match app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})) {
                     Ok(_) => true,
