@@ -3464,7 +3464,13 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 }
             });
             let applied = ui.button(tl!("Apply")).clicked()
-                && app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})).is_ok();
+                && match app.run("layer.symbology", json!({"type": "unique", "field": selected.clone()})) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        app.session.notify(error, true);
+                        false
+                    }
+                };
             if applied {
                 app.ui.symbology_pending = None;
             } else if selected != pending_field {
