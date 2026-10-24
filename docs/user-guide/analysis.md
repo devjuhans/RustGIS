@@ -296,7 +296,11 @@ help; there the help by the cursor is the tool's. A `task.addStep` line works th
 `"command": "` offers the commands, and its `"params"` that command's keys and help. For a
 command that takes them, `"layer": "` offers the map's layers, top first, each with its kind's
 icon and beside it what it holds; `"field": "` offers the fields of the layer the line names
-(before or after it), or of the active layer when it names none, with each field's type beside it. Accepting one writes its name
+(before or after it), or of the active layer when it names none, with each field's type beside it.
+In a `gp.run` line's `"params"`, a value offers what the tool's parameter takes, as the tool's
+form does: the layers of its kind (polygon, point, raster, vector; any layer, then the tables),
+the fields of the tool's input that it takes (numeric, holding coordinates), or its choices
+(`"units": "` offers `Kilometers`, `Meters`, …). Accepting one writes its name
 as the line's JSON needs it (`"Big \"lakes\""`). A `{` or `[`
 typed closes itself, the cursor inside, unless text follows it or it's in a string or a comment;
 so does a `"` where a string can start (after a space, `{`, `[`, `,` or `:`). A `}` or `]` typed
@@ -532,6 +536,20 @@ rustgis-cli run --cmd 'cube.reduce={"layers":["ndvi_2015","ndvi_2016","ndvi_2017
 rustgis-cli run --data cobertura_1985.tif --data cobertura_1986.tif --data cobertura_1987.tif --cmd 'cube.reduce={"layers":["cobertura_1985","cobertura_1986","cobertura_1987"],"stat":"changes"}'
 rustgis-cli run --cmd 'cube.reduce={"url":"https://data.inpe.br/bdc/stac/v1","collection":"mod13q1-6.1","asset":"NDVI","bbox":[-44.8,-7.5,-44.3,-7.0],"start":"2001","end":"2025","cellSize":1000,"stat":"mean","by":"year","minValid":0.5,"name":"NDVI"}' --save urucui.rgis
 ```
+
+## Zonal statistics and polygon clipping
+
+Zonal Statistics uses the selected polygon features when the layer has a selection. It keeps
+original geometries and fields, and reports features with missing or rejected polygon parts.
+If any polygon part fails validation or transformation, the feature receives count 0 and null
+statistics, so results never summarize only the surviving parts. Large
+overlapping zones each require a separate pass over their raster window.
+
+For `raster.process` polygon clipping, `selectedOnly: true` requires a selection,
+`selectedOnly: false` uses every polygon, and omitting it uses the selection when present.
+The Process pane initially checks Selected only when the chosen layer has a selection, and sends
+the choice explicitly. Clipping and Zonal Statistics share
+polygon transformation rules so a failed hole cannot silently enlarge the sampled area.
 
 ## Deep learning and hosted imagery
 

@@ -36,6 +36,16 @@ pub struct Workflow {
     /// The Script pane's last run, shown above its results.
     pub script_last: Option<ScriptRun>,
     pub trend: TrendForm,
+    pub selected_only: Option<bool>,
+    pub zonal_stats: ZonalStatsForm,
+}
+
+/// The Zonal Statistics section's inputs.
+#[derive(Default)]
+pub struct ZonalStatsForm {
+    pub bands: String,
+    pub prefix: String,
+    pub output: String,
 }
 
 /// A Script pane run, as the line above its results tells it: its number this session (so a run
@@ -124,6 +134,7 @@ pub const SECTIONS: &[(&str, &str)] = &[
     ("rasterFunctions", "Raster Functions"),
     ("functionEditor", "Function Editor"),
     ("suitability", "Suitability Modeler"),
+    ("zonalStats", "Zonal Statistics"),
     ("visibility", "Visibility Analysis"),
     ("lineOfSight", "Exploratory 3D Analysis"),
     ("interpolate", "Geostatistical Wizard"),
@@ -206,6 +217,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let inputs = match w.section {
         "rasterFunctions" | "functionEditor" | "suitability" | "visibility" | "lineOfSight" | "georeference" | "change" | "spectral"
         | "classify" | "supervised" | "deepLearning" | "hosted" | "indices" | "process" | "pixels" | "mensuration" | "reality"
+        | "zonalStats"
         // The trend's one-layer mode takes a raster (a Zarr variable, or a raster of several bands).
         | "trend" => &rasters,
         "interpolate" => &points,
@@ -215,6 +227,9 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     };
     if !inputs.contains(&w.layer) {
         w.layer = inputs.first().cloned().unwrap_or_default();
+    }
+    if (w.section == "zonalStats" || w.section == "process") && !polygons.contains(&w.layer2) {
+        w.layer2 = polygons.first().cloned().unwrap_or_default();
     }
     ui.add_space(6.0);
     match app.workflow.section {
@@ -299,6 +314,66 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let c1 = crit(app, &app.workflow.layer, true, num(&app.workflow.number, 1.0));
                 let c2 = crit(app, &app.workflow.layer2, false, num(&app.workflow.number2, 1.0));
                 run(app, "analysis.suitability", json!({"criteria": [c1, c2]}));
+            }
+        }
+        "zonalStats" => {
+            heading(ui, "Calculate raster statistics per polygon");
+            ui.label(egui::RichText::new(tl!("Raster layer")).small().weak());
+            combo(ui, "wf_zs_raster", "Raster layer", &mut app.workflow.layer, &rasters);
+            ui.label(egui::RichText::new(tl!("Polygon layer")).small().weak());
+            combo(ui, "wf_zs_poly", "Polygon layer", &mut app.workflow.layer2, &polygons);
+            ui.horizontal(|ui| {
+                let band_label = ui.label(tl!("Band"));
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.zonal_stats.bands).hint_text("1").desired_width(40.0))
+                    .labelled_by(band_label.id);
+                let prefix_label = ui.label(tl!("Prefix"));
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.zonal_stats.prefix).hint_text("elev").desired_width(70.0))
+                    .labelled_by(prefix_label.id);
+            });
+            ui.horizontal(|ui| {
+                let output_label = ui.label(tl!("Output"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.workflow.zonal_stats.output)
+                        .hint_text(tl!("output layer name"))
+                        .desired_width(120.0),
+                )
+                .labelled_by(output_label.id);
+            });
+            let band_str = app.workflow.zonal_stats.bands.trim();
+            let total_bands = app
+                .session
+                .map()
+                .layer_by_name(&app.workflow.layer)
+                .and_then(|l| l.raster.as_ref())
+                .and_then(|r| r.data.as_ref())
+                .map(|d| d.bands.len())
+                .unwrap_or(1);
+            let band_res =
+                if band_str.is_empty() { Ok(vec![0]) } else { rustgis_engine::analysis::rasterops::parse_bands_str(band_str, total_bands) };
+            let band_valid = band_res.is_ok();
+            let band_err = band_res.err();
+            let layers_ready = !app.workflow.layer.is_empty() && !app.workflow.layer2.is_empty();
+            let can_run = layers_ready && band_valid;
+            if !layers_ready {
+                ui.label(egui::RichText::new(tl!("Add a raster and a polygon layer to calculate zonal statistics.")).small().weak());
+            } else if let Some(err) = band_err {
+                ui.label(egui::RichText::new(err).small().color(t.amber));
+            }
+            if ui.add_enabled(can_run, egui::Button::new(tl!("Calculate Statistics"))).clicked() {
+                let mut params = json!({
+                    "raster": app.workflow.layer,
+                    "polygons": app.workflow.layer2,
+                });
+                if !band_str.is_empty() {
+                    params["bands"] = json!(band_str);
+                }
+                if !app.workflow.zonal_stats.prefix.trim().is_empty() {
+                    params["prefix"] = json!(app.workflow.zonal_stats.prefix.trim());
+                }
+                if !app.workflow.zonal_stats.output.trim().is_empty() {
+                    params["output"] = json!(app.workflow.zonal_stats.output.trim());
+                }
+                run(app, "gp.zonalStats", params);
             }
         }
         "visibility" => {
@@ -611,13 +686,69 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         "process" => {
             heading(ui, "Clip or resample");
-            combo(ui, "wf_pr", "Layer", &mut app.workflow.layer, &rasters);
+            combo(ui, "wf_pr", "Raster layer", &mut app.workflow.layer, &rasters);
+
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(tl!("Clip to polygon layer")).small().weak());
+            let has_polys = !polygons.is_empty();
+            if has_polys {
+                let layer2_before = app.workflow.layer2.clone();
+                combo(ui, "wf_pr_poly", "Polygon layer", &mut app.workflow.layer2, &polygons);
+                if app.workflow.layer2 != layer2_before {
+                    app.workflow.selected_only = None;
+                }
+                let poly_layer = app.session.map().layer_by_name(&app.workflow.layer2);
+                let sel_count = poly_layer.as_ref().map_or(0, |l| l.selection.len());
+                let total_features = poly_layer.as_ref().map_or(0, |l| l.dataset.features.len());
+
+                let effective_selected_only = app.workflow.selected_only.unwrap_or(sel_count > 0);
+                let mut checked = effective_selected_only;
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut checked, tl!("Selected only")).changed() {
+                        app.workflow.selected_only = Some(checked);
+                    }
+                    if sel_count > 0 {
+                        let text = crate::i18n::fmt(
+                            "({selected} of {total})",
+                            &[("selected", &sel_count.to_string()), ("total", &total_features.to_string())],
+                        );
+                        ui.label(egui::RichText::new(text).small().weak());
+                    }
+                });
+
+                let sel_invalid = effective_selected_only && sel_count == 0;
+                let can_clip_poly = !app.workflow.layer.is_empty() && !app.workflow.layer2.is_empty() && !sel_invalid;
+
+                if sel_invalid {
+                    ui.label(egui::RichText::new(tl!("No features are selected in this layer.")).small().color(t.amber));
+                }
+
+                if ui.add_enabled(can_clip_poly, egui::Button::new(tl!("Clip To Polygon"))).clicked() {
+                    let mut p = json!({
+                        "layer": app.workflow.layer,
+                        "operation": "clip",
+                        "polygon": app.workflow.layer2,
+                    });
+                    p["selectedOnly"] = json!(app.workflow.selected_only);
+                    run(app, "raster.process", p);
+                }
+            } else {
+                ui.label(egui::RichText::new(tl!("No polygon layer available in the map.")).small().weak());
+            }
+
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button(tl!("Clip To Map View")).clicked() {
+                if ui.add_enabled(!app.workflow.layer.is_empty(), egui::Button::new(tl!("Clip To Map View"))).clicked() {
                     run(app, "raster.process", json!({"layer": app.workflow.layer, "operation": "clip"}));
                 }
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("factor")).desired_width(50.0));
-                if ui.button(tl!("Resample")).clicked() {
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let factor_label = ui.label(tl!("factor"));
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("factor")).desired_width(50.0))
+                    .labelled_by(factor_label.id);
+                if ui.add_enabled(!app.workflow.layer.is_empty(), egui::Button::new(tl!("Resample"))).clicked() {
                     run(
                         app,
                         "raster.process",
@@ -1243,6 +1374,11 @@ mod tests {
                 assert_eq!(h.query_all_by_role_and_label(egui::accesskit::Role::TextInput, "Weights").count(), 2);
                 for label in ["First raster", "Second raster"] {
                     assert!(h.query_by_role_and_label(egui::accesskit::Role::ComboBox, label).is_some());
+                }
+            }
+            if section == "zonalStats" {
+                for label in ["Band", "Prefix", "Output"] {
+                    assert!(h.query_by_role_and_label(egui::accesskit::Role::TextInput, label).is_some());
                 }
             }
         }

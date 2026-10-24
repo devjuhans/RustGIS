@@ -235,6 +235,30 @@ fn command_search_workflow_collects_inputs_before_georeferencing() {
     assert_eq!(h.state().ui.right, Some(rustgis_ui_egui::RightPane::Workflows));
 }
 
+/// Clipping follows a selection until the user explicitly opts out, even after changing it.
+#[test]
+fn polygon_clip_defaults_to_selection_and_honors_opt_out() {
+    let mut h = harness();
+    h.state_mut().workflow.layer2 = "Countries".into();
+    h.state_mut().run("ui.pane.workflows", json!(null)).unwrap();
+    h.state_mut().workflow.section = "process";
+    h.state_mut().session.map_mut().layers.iter_mut().find(|l| l.name == "Countries").unwrap().selection.push(0);
+    h.run_steps(4);
+    assert_eq!(h.state().workflow.selected_only, None);
+    let total = h.state().session.map().layer_by_name("Countries").unwrap().dataset.features.len();
+    assert!(h.query_by_label(&format!("(1 of {total})")).is_some());
+    h.get_by_label("Selected only").click();
+    h.run_steps(3);
+    assert_eq!(h.state().workflow.selected_only, Some(false));
+    h.state_mut().session.map_mut().layers.iter_mut().find(|l| l.name == "Countries").unwrap().selection.push(1);
+    h.run_steps(3);
+    assert_eq!(h.state().workflow.selected_only, Some(false));
+    assert!(h.query_by_label(&format!("(2 of {total})")).is_some());
+    h.get_by_label("Selected only").click();
+    h.run_steps(3);
+    assert_eq!(h.state().workflow.selected_only, Some(true));
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn mcp_relay_early_start_wakes_queued_request_and_updates_ui() {
@@ -1400,6 +1424,55 @@ fn data_from_a_web_address_lands_later() {
     assert!(h.state().session.map().layer_by_name("Pin").is_some());
     assert!(h.state().session.notices.iter().any(|n| n.error && n.text.contains("never fetched")));
     assert!(h.state().ui.downloads.is_empty());
+}
+
+/// A service layer added from the app (Add From Service, the Connections tree) is read past its
+/// first page off the frame (#764): an ArcGIS layer again from the start in pages ordered by its
+/// object ids, an OGC API collection by its `next` links; the layer is added once the pages are
+/// in, with no note.
+#[test]
+fn service_features_are_read_page_by_page_off_the_frame() {
+    use ogc_server::{Route, Server, arcgis_layer, arcgis_page};
+    let q = "where=1%3D1&outFields=*&f=geojson";
+    let layer = "/arcgis/rest/services/P/MapServer/0";
+    let page = |offset: u32| format!("{layer}/query?{q}&resultOffset={offset}&resultRecordCount=2&orderByFields=OBJECTID");
+    let collection = |ids: &[u32], next: Option<&str>| {
+        let mut c: serde_json::Value = serde_json::from_str(&arcgis_page(ids, false)).unwrap();
+        if let Some(href) = next {
+            c["links"] = json!([{"rel": "next", "href": href}]);
+        }
+        c.to_string()
+    };
+    let server = Server::new(vec![
+        Route::new(&format!("{layer}/query?{q}"), &arcgis_page(&[3, 0], true)),
+        Route::new(layer, &arcgis_layer(2, true)),
+        Route::new(&page(0), &arcgis_page(&[0, 1], true)),
+        Route::new(&page(2), &arcgis_page(&[2, 3], true)),
+        Route::new(&page(4), &arcgis_page(&[4], false)),
+        Route::new("/collections/wells/items?page=2", &collection(&[2], None)),
+        Route::new("/collections/wells/items", &collection(&[0, 1], Some("items?page=2"))),
+    ]);
+    let mut h = harness();
+    h.step();
+    let base = server.base.clone();
+    h.state_mut().run("ui.addUrl", json!({"url": format!("{base}{layer}/query?{q}"), "name": "Parcels", "service": true})).unwrap();
+    h.state_mut().run("ui.addUrl", json!({"url": format!("{base}/collections/wells/items"), "name": "Wells", "service": true})).unwrap();
+    let ids = |app: &RustGisApp, name: &str| {
+        app.session.map().layer_by_name(name).map(|l| l.dataset.features.iter().map(|f| f.attrs[0].as_f64()).collect::<Vec<_>>())
+    };
+    wait_for_ogc(&mut h, |app| ids(app, "Parcels").is_some() && ids(app, "Wells").is_some());
+    let notes: Vec<_> = h.state().session.notices.iter().map(|n| n.text.clone()).collect();
+    let n = |i: &[u32]| Some(i.iter().map(|&i| Some(f64::from(i))).collect::<Vec<_>>());
+    assert_eq!((ids(h.state(), "Parcels"), ids(h.state(), "Wells")), (n(&[0, 1, 2, 3, 4]), n(&[0, 1, 2])), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("aren't read")), "{notes:?}");
+    assert!(h.state().ui.service_pages.is_empty() && h.state().ui.downloads.is_empty());
+    let offsets: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.ends_with("/0/query"))
+        .map(|r| r.query.into_iter().find(|(k, _)| k == "resultOffset").map(|(_, v)| v))
+        .collect();
+    assert_eq!(offsets, [None, Some("0".into()), Some("2".into()), Some("4".into())]);
 }
 
 /// A project by its web address (a `?project=` link) downloads off the frame and replaces the

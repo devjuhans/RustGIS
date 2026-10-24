@@ -596,6 +596,34 @@ fn a_reference_scale_is_set_kept_and_undone() {
 }
 
 #[test]
+fn rivers_are_labelled_along_their_lines_in_italics() {
+    let mut s = world();
+    s.run("labels.field", &json!({"layer": "Rivers", "field": "name"})).unwrap();
+    s.run("labels.placement", &json!({"layer": "Rivers", "position": "curved"})).unwrap();
+    s.run("labels.style", &json!({"layer": "Rivers", "italic": true})).unwrap();
+    let check = |s: &Session| {
+        let c = &s.map().layer_by_name("Rivers").unwrap().labels.default;
+        assert_eq!((c.placement, c.italic), (rustgis_map::LabelPlacement::Curved, true));
+    };
+    check(&s);
+    let dir = std::env::temp_dir().join(format!("rustgis-line-labels-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("labels.rgis");
+    s.run("project.saveAs", &json!({"path": path.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": path.display().to_string()})).unwrap();
+    check(&t);
+    t.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 320, "height": 200})).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    s.run("labels.placement", &json!({"layer": "Rivers", "position": "parallel"})).unwrap();
+    assert_eq!(s.map().layer_by_name("Rivers").unwrap().labels.default.placement, rustgis_map::LabelPlacement::Parallel);
+    // Not slanted unless asked: a project from before reads as upright.
+    s.run("labels.style", &json!({"layer": "Rivers", "italic": false})).unwrap();
+    let text = serde_json::to_string(&s.map().layer_by_name("Rivers").unwrap().labels).unwrap();
+    assert!(!text.contains("italic"), "{text}");
+}
+
+#[test]
 fn project_save_and_open_roundtrip() {
     let mut s = world();
     let dir = std::env::temp_dir().join(format!("rustgis-test-{}", std::process::id()));
@@ -1330,6 +1358,8 @@ fn hostile_params_never_panic() {
         json!({"type": "albers", "lon_0": f64::MAX, "lat_1": "x", "lat_2": -1e308}),
         json!({"kind": "legend", "element": 1, "exclude": [null, 7, "", {"x": 1}]}),
         json!({"kind": "text", "element": 1, "font": {"family": "serif"}, "italic": [], "align": 7}),
+        // A label class placed along lines, with junk the placement and style read after it.
+        json!({"layer": "Countries", "position": "curved", "italic": "maybe", "size": -1e308}),
         // A publication sheet's style, accent and orientation, and a shape's rounded corners.
         // (The profile left out or valid, so the style and accent are reached.)
         json!({"style": 7, "accent": "#XYZ", "kind": "ellipse", "element": 1, "radius": "x"}),
@@ -7613,6 +7643,62 @@ fn ogc_api_features_follow_next_pages() {
     assert!(s.notices.iter().any(|n| n.text.starts_with("Inward: ") && n.text.contains("never fetched")));
 }
 
+/// An ArcGIS layer past its record limit is read again in pages ordered by its object ids, from
+/// the start (its first page, in the server's own order, may hold other features than the ordered
+/// first: Hawaii's zoning did), when its description says it can be; a layer that can't keeps its
+/// first page, and says so.
+#[test]
+fn arcgis_features_read_past_the_record_limit() {
+    use ogc_server::{Route, Server, arcgis_layer, arcgis_page};
+    let q = "where=1%3D1&outFields=*&returnGeometry=true&outSR=4326&f=geojson";
+    let parcels = "/arcgis/rest/services/P/MapServer/0";
+    let page = |offset: u32| format!("{parcels}/query?{q}&resultOffset={offset}&resultRecordCount=2&orderByFields=OBJECTID");
+    let server = Server::new(vec![
+        // The first page in the server's own order: two of the five, not the ordered first two.
+        Route::new(&format!("{parcels}/query?{q}"), &arcgis_page(&[3, 0], true)),
+        Route::new(parcels, &arcgis_layer(2, true)),
+        Route::new(&page(0), &arcgis_page(&[0, 1], true)),
+        Route::new(&page(2), &arcgis_page(&[2, 3], true)),
+        Route::new(&page(4), &arcgis_page(&[4], false)),
+        Route::new("/arcgis/rest/services/P/MapServer/1/query", &arcgis_page(&[0, 1], true)),
+        Route::new("/arcgis/rest/services/P/MapServer/1", &arcgis_layer(2, false)),
+    ]);
+    let service = r#"{"currentVersion": 11.5, "maxRecordCount": 2, "layers": [{"id": 0, "name": "Parcels"}, {"id": 1, "name": "Zoning"}]}"#;
+    let url = format!("{}/arcgis/rest/services/P/MapServer", server.base);
+    let mut s = Session::new(Project::default());
+    let r = s.run("service.add", &json!({"url": url, "layer": "Parcels", "text": service})).unwrap();
+    assert_eq!(r["features"], 5);
+    let ids: Vec<_> = s.map().layer_by_name("Parcels").unwrap().dataset.features.iter().map(|f| f.attrs[0].as_f64()).collect();
+    assert_eq!(ids, [Some(0.0), Some(1.0), Some(2.0), Some(3.0), Some(4.0)]);
+    assert!(!s.notices.iter().any(|n| n.text.contains("aren't read")), "{:?}", s.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
+    let r = s.run("service.add", &json!({"url": url, "layer": "Zoning", "text": service})).unwrap();
+    assert_eq!(r["features"], 2);
+    assert!(s.notices.iter().any(|n| n.text.starts_with("Zoning: ") && n.text.contains("record limit")));
+    // The description once, then the pages from the start; a layer that can't page, its
+    // description alone.
+    let asked: Vec<_> = server
+        .requests()
+        .iter()
+        .map(|r| {
+            let offset = r.query.iter().find(|(k, _)| k == "resultOffset").map(|(_, v)| v.clone());
+            (r.path.trim_start_matches("/arcgis/rest/services/P/MapServer").to_string(), offset)
+        })
+        .collect();
+    let at = |path: &str, offset: Option<&str>| (path.to_string(), offset.map(str::to_string));
+    assert_eq!(
+        asked,
+        [
+            at("/0/query", None),
+            at("/0", None),
+            at("/0/query", Some("0")),
+            at("/0/query", Some("2")),
+            at("/0/query", Some("4")),
+            at("/1/query", None),
+            at("/1", None)
+        ]
+    );
+}
+
 /// A WCS coverage (from a local server) becomes a raster of the view, asked for in EPSG:4326 within
 /// its bounds; an error answer is refused. A catalogue's records come with the links RustGIS can
 /// follow, those pointing inward left out.
@@ -11220,7 +11306,14 @@ fn literal_keys(body: &str, prefix: &str) -> Vec<String> {
 #[test]
 fn params_name_every_key_a_command_reads() {
     // Read by a shared helper but of no use to the command.
-    let unused = [("gp.spatialJoin", "input"), ("profile.alongSelected", "row"), ("sources.remove", "name"), ("sources.remove", "extra")];
+    let unused = [
+        ("gp.spatialJoin", "input"),
+        ("gp.zonalStats", "input"),
+        ("gp.zonalStats", "target"),
+        ("profile.alongSelected", "row"),
+        ("sources.remove", "name"),
+        ("sources.remove", "extra"),
+    ];
     let s = Session::new(Project::default());
     let mut missing = Vec::new();
     let found = keys_read_by_commands();
@@ -14163,6 +14256,49 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
     assert!(e.to_string().contains("no cell"), "{e}");
     assert!(s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "west"})).is_err());
 
+    // selectedOnly: true with no selected features fails with a descriptive error.
+    s.map_mut().layers.iter_mut().find(|l| l.name == "City").unwrap().selection.clear();
+    let e_sel_none =
+        s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "City", "selectedOnly": true})).unwrap_err();
+    assert!(e_sel_none.to_string().contains("no features are selected"), "{e_sel_none}");
+
+    // Add a second feature to City further east in dem's extent.
+    let ring2 = [ll(361_500.0, 5_700_000.0), ll(362_000.0, 5_700_000.0), ll(362_000.0, 5_699_000.0), ll(361_500.0, 5_700_000.0)];
+    s.run("edit.addFeature", &json!({"layer": "City", "geometry": {"type": "Polygon", "coordinates": [ring2]}})).unwrap();
+    assert_eq!(s.map().layer_by_name("City").unwrap().dataset.features.len(), 2);
+
+    // With feature 0 selected: selectedOnly: true clips only feature 0.
+    s.map_mut().layers.iter_mut().find(|l| l.name == "City").unwrap().selection = vec![0];
+    let v_sel = s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "City", "selectedOnly": true})).unwrap();
+    let c_sel = raster(&s, &v_sel);
+    assert_eq!(c_sel.bands[0].stats.count, 25);
+
+    // selectedOnly: false clips all features even with selection active.
+    let v_all = s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "City", "selectedOnly": false})).unwrap();
+    let c_all = raster(&s, &v_all);
+    assert!(c_all.bands[0].stats.count > 25);
+
+    // An empty polygon layer fails validation.
+    s.run("layer.template", &json!({"template": "polygons", "name": "EmptyPoly"})).unwrap();
+    let e_empty = s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "EmptyPoly"})).unwrap_err();
+    assert!(e_empty.to_string().contains("has no features"), "{e_empty}");
+
+    // A polygon layer in a projected CRS (UTM) reprojects and clips accurately.
+    let mut proj_ds = rustgis_data::Dataset::new("CityProj", rustgis_data::GeometryType::Polygon, vec![]);
+    proj_ds.crs = Some(utm);
+    let utm_ring = [
+        rustgis_geom::Coord::new(360_500.0, 5_700_000.0),
+        rustgis_geom::Coord::new(361_500.0, 5_700_000.0),
+        rustgis_geom::Coord::new(361_500.0, 5_699_500.0),
+        rustgis_geom::Coord::new(360_500.0, 5_700_000.0),
+    ];
+    proj_ds.push(Some(rustgis_data::Geometry::Polygon(vec![vec![utm_ring.to_vec()]])), vec![]);
+    s.map_mut().add_layer(rustgis_map::Layer::new(0, proj_ds));
+    let v_proj = s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "CityProj"})).unwrap();
+    let c_proj = raster(&s, &v_proj);
+    assert_eq!((c_proj.width, c_proj.height, c_proj.crs), (9, 5, utm));
+    assert_eq!(c_proj.bands[0].stats.count, 25);
+
     // One stretch shared across tiles, as fixed bounds.
     s.run("raster.stretch", &json!({"layer": "west", "type": "custom", "min": 100, "max": 300})).unwrap();
     s.run("raster.stretch", &json!({"layer": "east", "like": "west"})).unwrap();
@@ -15116,6 +15252,332 @@ fn scans_have_no_coordinates_to_give_away() {
     s.run("raster.georeference", &json!({"layer": "flat", "extent": [10.0, 40.0, 12.0, 41.0]})).unwrap();
     assert!(s.run("share.exportRaster", &json!({"path": out.display().to_string()})).is_ok());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gp_zonal_stats_end_to_end_and_undo() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    use rustgis_geom::Coord;
+
+    let mut s = world();
+
+    let (w, h) = (10u32, 10u32);
+    let mut data = Vec::with_capacity((w * h) as usize);
+    for row in 0..h {
+        for col in 0..w {
+            data.push((col * 10 + row) as f32);
+        }
+    }
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 1.0, pixel_height: -1.0 };
+    let raster = Raster::new("dem", w, h, vec![data], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    let raster_layer = rustgis_map::RasterLayer::from_path(raster, "dem.tif");
+    s.map_mut().add_raster("dem", raster_layer);
+
+    let mut poly_ds = Dataset::new("districts", GeometryType::Polygon, vec![Field::new("code", FieldType::Text)]);
+    let sq = |x0: f64, y0: f64, x1: f64, y1: f64| {
+        Geometry::Polygon(vec![vec![vec![
+            Coord::new(x0, y0),
+            Coord::new(x1, y0),
+            Coord::new(x1, y1),
+            Coord::new(x0, y1),
+            Coord::new(x0, y0),
+        ]]])
+    };
+    poly_ds.push(Some(sq(1.0, 7.0, 3.0, 9.0)), vec![Value::Text("D1".into())]);
+    poly_ds.push(Some(sq(50.0, 50.0, 52.0, 52.0)), vec![Value::Text("D2".into())]);
+    s.map_mut().add_layer(rustgis_map::Layer::new(0, poly_ds));
+
+    let layers_before = s.map().layers.len();
+
+    let res = s.run(
+        "gp.zonalStats",
+        &json!({
+            "raster": "dem",
+            "polygons": "districts",
+            "output": "zonal_out",
+        }),
+    );
+    assert!(res.is_ok(), "gp.zonalStats failed: {res:?}");
+    assert_eq!(s.map().layers.len(), layers_before + 1);
+
+    let out_layer = s.map().layer_by_name("zonal_out").expect("output layer should exist");
+    assert_eq!(out_layer.dataset.features.len(), 2);
+
+    let mean_idx = out_layer.dataset.field_index("dem_mean").expect("dem_mean field");
+    let count_idx = out_layer.dataset.field_index("dem_count").expect("dem_count field");
+    let min_idx = out_layer.dataset.field_index("dem_min").expect("dem_min field");
+    let max_idx = out_layer.dataset.field_index("dem_max").expect("dem_max field");
+    let sum_idx = out_layer.dataset.field_index("dem_sum").expect("dem_sum field");
+    let stddev_idx = out_layer.dataset.field_index("dem_stddev").expect("dem_stddev field");
+
+    assert_eq!(out_layer.dataset.value(0, 0), &Value::Text("D1".into()));
+    assert_eq!(out_layer.dataset.value(0, count_idx), &Value::Int(4));
+    assert_eq!(out_layer.dataset.value(0, mean_idx), &Value::Float(16.5));
+    assert_eq!(out_layer.dataset.value(0, min_idx), &Value::Float(11.0));
+    assert_eq!(out_layer.dataset.value(0, max_idx), &Value::Float(22.0));
+    assert_eq!(out_layer.dataset.value(0, sum_idx), &Value::Float(66.0));
+    let std = out_layer.dataset.value(0, stddev_idx).as_f64().unwrap();
+    assert!((std - 25.25f64.sqrt()).abs() < 1e-10);
+
+    assert_eq!(out_layer.dataset.value(1, 0), &Value::Text("D2".into()));
+    assert_eq!(out_layer.dataset.value(1, count_idx), &Value::Int(0));
+    assert_eq!(out_layer.dataset.value(1, mean_idx), &Value::Null);
+    assert_eq!(out_layer.dataset.value(1, min_idx), &Value::Null);
+    assert_eq!(out_layer.dataset.value(1, max_idx), &Value::Null);
+    assert_eq!(out_layer.dataset.value(1, sum_idx), &Value::Null);
+    assert_eq!(out_layer.dataset.value(1, stddev_idx), &Value::Null);
+
+    assert!(s.undo());
+    assert_eq!(s.map().layers.len(), layers_before);
+    assert!(s.map().layer_by_name("zonal_out").is_none());
+
+    assert!(s.redo());
+    assert_eq!(s.map().layers.len(), layers_before + 1);
+    assert!(s.map().layer_by_name("zonal_out").is_some());
+
+    let run_res = s.run(
+        "gp.run",
+        &json!({
+            "tool": "zonalStats",
+            "params": {
+                "raster": "dem",
+                "polygons": "districts",
+                "stats": ["mean", "count"],
+                "output": "via_gp_run",
+            }
+        }),
+    );
+    assert!(run_res.is_ok(), "gp.run with zonalStats failed: {run_res:?}");
+    let run_layer = s.map().layer_by_name("via_gp_run").expect("via_gp_run layer should exist");
+    assert!(run_layer.dataset.field_index("dem_mean").is_some());
+    assert!(run_layer.dataset.field_index("dem_count").is_some());
+    assert!(run_layer.dataset.field_index("dem_min").is_none());
+
+    // Projected CRS (WebMercator) reprojection end-to-end
+    let merc_tr = Crs::WebMercator.transformer().unwrap();
+    let mp0 = merc_tr.from_lonlat(Coord::new(1.0, 7.0)).unwrap();
+    let mp1 = merc_tr.from_lonlat(Coord::new(3.0, 9.0)).unwrap();
+    let mut merc_ds = Dataset::new("merc_districts", GeometryType::Polygon, vec![Field::new("code", FieldType::Text)]);
+    merc_ds.crs = Some(Crs::WebMercator);
+    merc_ds.push(Some(sq(mp0.x, mp0.y, mp1.x, mp1.y)), vec![Value::Text("M1".into())]);
+    s.map_mut().add_layer(rustgis_map::Layer::new(0, merc_ds));
+
+    let merc_res = s.run(
+        "gp.zonalStats",
+        &json!({
+            "raster": "dem",
+            "polygons": "merc_districts",
+            "output": "merc_out",
+            "bands": [1.0],
+        }),
+    );
+    assert!(merc_res.is_ok(), "gp.zonalStats with WebMercator failed: {merc_res:?}");
+    let merc_layer = s.map().layer_by_name("merc_out").expect("merc_out should exist");
+    assert_eq!(merc_layer.dataset.crs, Some(Crs::WebMercator));
+    let m_count_idx = merc_layer.dataset.field_index("dem_count").unwrap();
+    let m_mean_idx = merc_layer.dataset.field_index("dem_mean").unwrap();
+    assert_eq!(merc_layer.dataset.value(0, m_count_idx), &Value::Int(4));
+    assert_eq!(merc_layer.dataset.value(0, m_mean_idx), &Value::Float(16.5));
+
+    // "bands": "all"
+    let all_res = s.run(
+        "gp.zonalStats",
+        &json!({
+            "raster": "dem",
+            "polygons": "districts",
+            "output": "all_bands_out",
+            "bands": "all",
+        }),
+    );
+    assert!(all_res.is_ok(), "gp.zonalStats with bands: all failed: {all_res:?}");
+
+    assert!(s.run("gp.zonalStats", &json!({})).is_err());
+    assert!(s.run("gp.zonalStats", &json!({"raster": "nonexistent", "polygons": "districts"})).is_err());
+    assert!(s.run("gp.zonalStats", &json!({"raster": "dem", "polygons": "Cities"})).is_err());
+    assert!(s.run("gp.zonalStats", &json!({"raster": "dem", "polygons": "districts", "bands": [999]})).is_err());
+    assert!(s.run("gp.zonalStats", &json!({"raster": "dem", "polygons": "districts", "bands": [0]})).is_err());
+    assert!(s.run("gp.zonalStats", &json!({"raster": "dem", "polygons": "districts", "bands": [-1]})).is_err());
+    assert!(s.run("gp.zonalStats", &json!({"raster": "dem", "polygons": "districts", "bands": [1.5]})).is_err());
+}
+
+#[test]
+fn raster_clip_polygon_selection_semantics_and_partial_failure() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    use rustgis_geom::Coord;
+
+    let mut s = world();
+
+    // 10x10 raster: origin (0.0, 10.0), cell size (1.0, -1.0)
+    let (w, h) = (10u32, 10u32);
+    let mut data = Vec::with_capacity((w * h) as usize);
+    for row in 0..h {
+        for col in 0..w {
+            data.push((col * 10 + row) as f32);
+        }
+    }
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 1.0, pixel_height: -1.0 };
+    let raster = Raster::new("dem", w, h, vec![data], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    let raster_layer = rustgis_map::RasterLayer::from_path(raster, "dem.tif");
+    s.map_mut().add_raster("dem", raster_layer);
+
+    let sq = |x0: f64, y0: f64, x1: f64, y1: f64| {
+        Geometry::Polygon(vec![vec![vec![
+            Coord::new(x0, y0),
+            Coord::new(x1, y0),
+            Coord::new(x1, y1),
+            Coord::new(x0, y1),
+            Coord::new(x0, y0),
+        ]]])
+    };
+
+    let mut poly_ds = Dataset::new("clip_zones", GeometryType::Polygon, vec![Field::new("name", FieldType::Text)]);
+    // Feature 0: [1.0, 7.0] to [3.0, 9.0]
+    poly_ds.push(Some(sq(1.0, 7.0, 3.0, 9.0)), vec![Value::Text("Z1".into())]);
+    // Feature 1: [2.0, 6.0] to [4.0, 8.0] (overlaps with Z1)
+    poly_ds.push(Some(sq(2.0, 6.0, 4.0, 8.0)), vec![Value::Text("Z2".into())]);
+    // Feature 2: [6.0, 1.0] to [8.0, 3.0] (separate area)
+    poly_ds.push(Some(sq(6.0, 1.0, 8.0, 3.0)), vec![Value::Text("Z3".into())]);
+    // Feature 3: Degenerate hole (< 3 coords) -> should trigger rejection of this feature
+    let bad_hole_poly = Geometry::Polygon(vec![vec![
+        vec![Coord::new(4.0, 4.0), Coord::new(6.0, 4.0), Coord::new(6.0, 6.0), Coord::new(4.0, 6.0), Coord::new(4.0, 4.0)],
+        vec![Coord::new(4.5, 4.5), Coord::new(5.0, 5.0)], // invalid hole with only 2 points
+    ]]);
+    poly_ds.push(Some(bad_hole_poly), vec![Value::Text("Z4_bad".into())]);
+
+    let poly_layer_id = s.map_mut().add_layer(rustgis_map::Layer::new(0, poly_ds));
+
+    // Test 1: selectedOnly: "invalid" or non-boolean returns validation error
+    let err_type = s.run(
+        "raster.process",
+        &json!({
+            "layer": "dem",
+            "operation": "clip",
+            "polygon": "clip_zones",
+            "selectedOnly": "yes",
+        }),
+    );
+    assert!(err_type.is_err());
+    assert!(err_type.unwrap_err().contains("must be a boolean"));
+
+    // Test 2: selectedOnly: true with empty selection returns error
+    let err_empty_sel = s.run(
+        "raster.process",
+        &json!({
+            "layer": "dem",
+            "operation": "clip",
+            "polygon": "clip_zones",
+            "selectedOnly": true,
+        }),
+    );
+    assert!(err_empty_sel.is_err());
+    assert!(err_empty_sel.unwrap_err().contains("no features are selected"));
+
+    // Test 3: selectedOnly: true with Feature 0 selected
+    {
+        let l = s.map_mut().layer_mut(poly_layer_id).unwrap();
+        l.selection = vec![0];
+    }
+    let res_sel = s.run(
+        "raster.process",
+        &json!({
+            "layer": "dem",
+            "operation": "clip",
+            "polygon": "clip_zones",
+            "selectedOnly": true,
+            "name": "dem_sel_0",
+        }),
+    );
+    assert!(res_sel.is_ok(), "clip selected failed: {res_sel:?}");
+    let sel_layer = s.map().layer_by_name("dem_sel_0").expect("dem_sel_0 exists");
+    let sel_raster = sel_layer.raster.as_ref().unwrap().data.as_ref().unwrap();
+    // Feature 0 covers x: [1.0, 3.0], y: [7.0, 9.0] -> 2 cols x 2 rows
+    assert_eq!(sel_raster.width, 2);
+    assert_eq!(sel_raster.height, 2);
+
+    // Test 4: Overlapping polygons combined coverage (Features 0 and 1)
+    {
+        let l = s.map_mut().layer_mut(poly_layer_id).unwrap();
+        l.selection = vec![0, 1];
+    }
+    let res_overlap = s.run(
+        "raster.process",
+        &json!({
+            "layer": "dem",
+            "operation": "clip",
+            "polygon": "clip_zones",
+            "selectedOnly": true,
+            "name": "dem_overlap",
+        }),
+    );
+    assert!(res_overlap.is_ok(), "clip overlap failed: {res_overlap:?}");
+    let ov_layer = s.map().layer_by_name("dem_overlap").expect("dem_overlap exists");
+    let ov_raster = ov_layer.raster.as_ref().unwrap().data.as_ref().unwrap();
+    // Features 0 & 1 union bounding box: x: [1.0, 4.0], y: [6.0, 9.0] -> 3 cols x 3 rows
+    assert_eq!(ov_raster.width, 3);
+    assert_eq!(ov_raster.height, 3);
+
+    // Test 5: selectedOnly: false ignores active selection and clips using all valid features
+    let res_all = s.run(
+        "raster.process",
+        &json!({
+            "layer": "dem",
+            "operation": "clip",
+            "polygon": "clip_zones",
+            "selectedOnly": false,
+            "name": "dem_all",
+        }),
+    );
+    assert!(res_all.is_ok(), "clip all failed: {res_all:?}");
+    let all_layer = s.map().layer_by_name("dem_all").expect("dem_all exists");
+    let all_raster = all_layer.raster.as_ref().unwrap().data.as_ref().unwrap();
+    // Features 0, 1, 2 bounding box spans x: [1.0, 8.0], y: [1.0, 9.0] -> 7 cols x 8 rows
+    assert_eq!(all_raster.width, 7);
+    assert_eq!(all_raster.height, 8);
+
+    // Test 6: Partial failure reporting: Feature 0 (valid) + Feature 3 (invalid hole)
+    // Feature 3 should be skipped with a warning, Feature 0 should succeed
+    {
+        let l = s.map_mut().layer_mut(poly_layer_id).unwrap();
+        l.selection = vec![0, 3];
+    }
+    let res_partial = s.run(
+        "raster.process",
+        &json!({
+            "layer": "dem",
+            "operation": "clip",
+            "polygon": "clip_zones",
+            "selectedOnly": true,
+            "name": "dem_partial",
+        }),
+    );
+    assert!(res_partial.is_ok(), "clip partial should succeed for valid feature: {res_partial:?}");
+    let partial_layer = s.map().layer_by_name("dem_partial").expect("dem_partial exists");
+    let partial_raster = partial_layer.raster.as_ref().unwrap().data.as_ref().unwrap();
+    assert_eq!(partial_raster.width, 2);
+    assert_eq!(partial_raster.height, 2);
+
+    // Test 7: Total failure when all selected features fail validation (only Feature 3 selected)
+    {
+        let l = s.map_mut().layer_mut(poly_layer_id).unwrap();
+        l.selection = vec![3];
+    }
+    let res_bad = s.run(
+        "raster.process",
+        &json!({
+            "layer": "dem",
+            "operation": "clip",
+            "polygon": "clip_zones",
+            "selectedOnly": true,
+            "name": "dem_bad",
+        }),
+    );
+    assert!(res_bad.is_err());
+    let err_msg = res_bad.unwrap_err();
+    assert!(err_msg.contains("has no valid polygon geometries"));
+    assert!(err_msg.contains("feature 4"));
+    assert!(err_msg.contains("hole 1 is invalid"));
 }
 
 #[test]
