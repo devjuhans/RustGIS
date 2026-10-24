@@ -3373,13 +3373,13 @@ fn pending_symbology(app: &RustGisApp, ctx: &egui::Context) -> Option<PendingSym
 
 /// Shows the active layer's renderer controls, including No Fill for polygon layers.
 fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    if app.ui.symbology_pending.as_ref().is_some_and(|pending| !pending.is_current(&app.session)) {
+        app.ui.symbology_pending = None;
+    }
     let Some(l) = app.session.active_layer.and_then(|id| app.session.map().layer(id)).cloned() else {
         ui.label(egui::RichText::new(tl!("Select a layer in the Layers pane.")).color(t.text_dim));
         return;
     };
-    if app.ui.symbology_pending.as_ref().is_some_and(|(id, _)| *id != l.id) {
-        app.ui.symbology_pending = None;
-    }
     if l.is_raster() {
         raster_symbology(app, ui, &l, t);
         return;
@@ -3442,7 +3442,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 if *code == "unique" && !all.is_empty() {
                     let field = l.dataset.fields.iter().find(|f| !f.ty.is_numeric()).or_else(|| l.dataset.fields.first());
                     if let Some(field) = field {
-                        app.ui.symbology_pending = Some((l.id, field.name.clone()));
+                        app.ui.symbology_pending = Some(crate::PendingUniqueSymbology::new(&app.session, &l, field.name.clone()));
                         clear_pending_symbology(ui.ctx());
                     }
                     continue;
@@ -3468,9 +3468,8 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
     });
     ui.add_space(8.0);
-    if let Some((pending_id, pending_field)) = app.ui.symbology_pending.clone()
-        && pending_id == l.id
-    {
+    if let Some(mut pending) = app.ui.symbology_pending.clone() {
+        let pending_field = pending.field.clone();
         let mut selected = if all.contains(&pending_field) { pending_field.clone() } else { all.first().cloned().unwrap_or_default() };
         ui.horizontal(|ui| {
             ui.label(tl!("Field"));
@@ -3490,7 +3489,8 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if applied {
                 app.ui.symbology_pending = None;
             } else if selected != pending_field {
-                app.ui.symbology_pending = Some((l.id, selected));
+                pending.field = selected;
+                app.ui.symbology_pending = Some(pending);
             }
         });
         ui.add_space(6.0);
